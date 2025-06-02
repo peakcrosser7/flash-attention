@@ -32,8 +32,8 @@ __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bid
         // When params.unpadded_lse is false, LSE is written as (b, h, seqlen_q) - this is non-variable seqlen path.
         // Otherwise, when params.seqlenq_ngroups_swapped is true, it is written as (h, seqlen_q, b) to account for seqlen_q <-> h swapping trick.
         // Otherwise, it's written as (h, b, seqlen_q).
-        const bool varlen_q = params.unpadded_lse && !params.seqlenq_ngroups_swapped;
-        auto lse_offset = varlen_q ? binfo.q_offset(params.seqlen_q, 1, bidb) : 0;
+        const bool varlen_q = params.unpadded_lse && !params.seqlenq_ngroups_swapped;   // lse shape(h, b, seqlen_q) if true
+        auto lse_offset = varlen_q ? binfo.q_offset(params.seqlen_q, 1, bidb) : 0;  // 当前batch_idx的LSE起始偏移
         auto gmem_ptr_lse = make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.softmax_lse_ptr) + lse_offset);
 
         auto lse_shape = varlen_q ? make_shape(1, params.h, params.total_q) : make_shape(params.b, params.h, params.seqlen_q);
@@ -78,9 +78,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     }
 
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
+    // 当前线程块M维度(矩阵Q序列长度维度)范围超过了矩阵Q序列长度,该线程块不参与计算直接返回 (M维度边界判断)
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
+    // 参与计算的矩阵K的起始分块 = 不使用局部序列计算Attention ? 从头开始 : 根据滑动窗口计算起始分块
     const int n_block_min = !Is_local ? 0 : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
+    // 参与计算的矩阵K的终止分块(不包括)
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
     if (Is_causal || Is_local) {
         n_block_max = std::min(n_block_max,
@@ -92,36 +95,44 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // We exit early and write 0 to gO and gLSE. This also covers the case where actual_seqlen_k == 0.
     // Otherwise we might read OOB elements from gK and gV.
     if ((Is_causal || Is_local || !Is_even_MN) && n_block_max <= n_block_min) {
+        // 当前线程块的当前batch_idx的矩阵O分块
+        // (actual_seqlen_q, num_head_q, head_dim):(o_row_stride,o_head_stride,_1)
         Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr)
                                               + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
                                 make_shape(binfo.actual_seqlen_q, params.h, params.d),
                                 make_stride(params.o_row_stride, params.o_head_stride, _1{}));
         Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                              // 这里coord的第2个坐标固定为0是因为FA将head_dim作为BlockTile的行维度
+                              // 且由于BlockTile的行宽就是kHeadDim,因此该维度只会划分为1个分块,因此可以直接指定
                               make_coord(m_block, 0));  // (kBlockM, kHeadDim)
 
+        // (kBlockM,)
         Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
 
         typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
         auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
-        Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
-        Tensor tOrO = make_tensor<Element>(shape(tOgO));
+        Tensor tOgO = gmem_thr_copy_O.partition_D(gO);      // (OCPY,OCPY_M,OCPY_K)
+        Tensor tOrO = make_tensor<Element>(shape(tOgO));    // (OCPY,OCPY_M,OCPY_K)
         clear(tOrO);
         // Construct identity layout for sO
         Tensor cO = make_identity_tensor(make_shape(size<0>(gO), size<1>(gO)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
         // Repeat the partitioning with identity layouts
-        Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
-        Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
-        if (!Is_even_K) {
+        Tensor tOcO = gmem_thr_copy_O.partition_D(cO);  // (OCPY,OCPY_M,OCPY_K)
+        Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO))); // (OCPY_K,)
+        if (!Is_even_K) {   // K维度大小不等于head_dim
+            // 记录K维度OCPY_K个OCPY的CopyAtom是否在head_dim范围内
             #pragma unroll
             for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
         }
+        // O R->G
         // Clear_OOB_K must be false since we don't want to write zeros to gmem
         FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
             gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
         );
         #pragma unroll
-        for (int m = 0; m < size<1>(tOgO); ++m) {
+        for (int m = 0; m < size<1>(tOgO); ++m) {   // OCPY_M
             const int row = get<0>(tOcO(0, m, 0));
+            // 将M维度在有效范围内且K维度为0(确保每行只有1个线程符合要求)将GMEM中LSE的BlockTile对应行写入INFINITY
             if (row < binfo.actual_seqlen_q - m_block * kBlockM && get<1>(tOcO(0, m, 0)) == 0) { gLSE(row) = INFINITY; }
         }
         return;
@@ -135,6 +146,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     const index_t row_offset_p = ((bidb * params.h + bidh) * params.seqlen_q_rounded
         + m_block * kBlockM) * params.seqlen_k_rounded + (n_block_max - 1) * kBlockN;
 
+    // (actual_seqlen_q,num_heads,head_dim) k-major
     Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr)
                                           + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
                             make_shape(binfo.actual_seqlen_q, params.h, params.d),
@@ -153,33 +165,35 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                             make_stride(params.v_row_stride, params.v_head_stride, _1{}));
     Tensor gV = local_tile(mV(_, bidh / params.h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
                            make_coord(_, 0));  // (kBlockN, kHeadDim, nblocksN)
+    // 当前线程块的矩阵P的BlockTile
     Tensor gP = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.p_ptr) + row_offset_p),
                             Shape<Int<kBlockM>, Int<kBlockN>>{},
-                            make_stride(params.seqlen_k_rounded, _1{}));
+                            make_stride(params.seqlen_k_rounded, _1{}));    // (kBlockM,kBlockN)
 
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
-                            typename Kernel_traits::SmemLayoutQ{});
+                            typename Kernel_traits::SmemLayoutQ{}); // (kBlockM,kHeadDim)
     // Careful we're using the same smem for sQ and sK | sV if Share_Q_K_smem;
     Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)),
-                            typename Kernel_traits::SmemLayoutKV{});
-    Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
-    Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
-    Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
+                            typename Kernel_traits::SmemLayoutKV{});    // (kBlockN,kHeadDim)
+    Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});  // (kBlockN,kHeadDim)
+    Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});   // (kHeadDim,kBlockN)
+    Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});   // (kHeadDim,kBlockN)
 
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
     auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
 
-    Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ);
-    Tensor tQsQ = gmem_thr_copy_QKV.partition_D(sQ);
+    Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ);  // (QCPY, QCPY_M, QCPY_K)
+    Tensor tQsQ = gmem_thr_copy_QKV.partition_D(sQ);  // (QCPY, QCPY_M, QCPY_K)
     Tensor tKgK = gmem_thr_copy_QKV.partition_S(gK);  // (KCPY, KCPY_N, KCPY_K, nblocksN)
-    Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
+    Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);  // (KCPY, KCPY_N, KCPY_K)
     Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K, nblocksN)
-    Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
+    Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);  // (VCPY, VCPY_N, VCPY_K)
 
     typename Kernel_traits::TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(tidx);
     Tensor tSrQ  = thr_mma.partition_fragment_A(sQ);                           // (MMA,MMA_M,MMA_K)
     Tensor tSrK  = thr_mma.partition_fragment_B(sK);                           // (MMA,MMA_N,MMA_K)
+    // [QTS] 为什么使用`sVtNoSwizzle`而非`sVt`?
     Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle);                // (MMA, MMA_K,MMA_N)
 
     Tensor tSgS  = thr_mma.partition_C(gP);
@@ -193,16 +207,16 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
     auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
     // if (cute::thread0()) {smem_thr_copy_Q.print_all();}
-    Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
+    Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);  // (QCPY,QCPY_M,QCPY_K)
     // if (cute::thread0()) {print(tSsQ.layout()); printf("\n");}
 
     auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
     auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tidx);
-    Tensor tSsK = smem_thr_copy_K.partition_S(sK);
+    Tensor tSsK = smem_thr_copy_K.partition_S(sK);  // (KCPY,KCPY_N,KCPY_K)
 
     auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma);
     auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
-    Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
+    Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);    // (VCPY,VCPY_K,VCPY_N)
 
     //
     // PREDICATES
@@ -229,15 +243,18 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // }
 
     // Repeat the partitioning with identity layouts
-    Tensor tQcQ = gmem_thr_copy_QKV.partition_S(cQ);       // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
-    Tensor tKVcKV = gmem_thr_copy_QKV.partition_S(cKV);   // (BCPY,BCPY_N,BCPY_K) -> (blk_n,blk_k)
+    Tensor tQcQ = gmem_thr_copy_QKV.partition_S(cQ);       // (QCPY,QCPY_M,QCPY_K) -> (blk_m,blk_k)
+    Tensor tKVcKV = gmem_thr_copy_QKV.partition_S(cKV);   // (KCPY,KCPY_N,kCPY_K) -> (blk_n,blk_k)
 
     // Allocate predicate tensors for k
-    Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
-    Tensor tKVpKV = make_tensor<bool>(make_shape(size<2>(tKsK)));
+    Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ))); // (QCPY_K,)
+    Tensor tKVpKV = make_tensor<bool>(make_shape(size<2>(tKsK)));   // (KCPY_K,)
 
     // Set predicates for k bounds
     if (!Is_even_K) {
+        // 记录K维度QCPY_K个QCPY的CopyAtom是否在head_dim范围内
+        // 此处QCPY为(_8,_1)即向量化访存的8个fp16/bf16,而head_dim大小在预处理时已经填充为8的倍数
+        // 因此此处可以在K维度按照QCPY的粒度进行边界检查
         #pragma unroll
         for (int k = 0; k < size(tQpQ); ++k) { tQpQ(k) = get<1>(tQcQ(0, 0, k)) < params.d; }
         #pragma unroll
@@ -246,6 +263,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     // Prologue
 
+    // Q G->S
     // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
                                        binfo.actual_seqlen_q - m_block * kBlockM);
@@ -265,9 +283,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     }
 
     int n_block = n_block_max - 1;
+    // 最后一个矩阵K的BlockTile G->S (KCPY,KCPY_N,KCPY_K)
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
-                                       binfo.actual_seqlen_k - n_block * kBlockN);
+                                       binfo.actual_seqlen_k - n_block * kBlockN);  // (KCPY, KCPY_N, KCPY_K)
     cute::cp_async_fence();
     // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z < 2) { print(tKgK); }
     // __syncthreads();
@@ -282,7 +301,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     clear(acc_o);
 
-    FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
+    // `*2`是因为MMAAtom中每个线程负责2行
+    FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;   // (2*MMA_M,)
 
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
     FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
@@ -296,19 +316,29 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // If not even_N, then seqlen_k might end in the middle of a block. In that case we need to
     // mask 2 blocks (e.g. when kBlockM == kBlockN), not just 1.
     constexpr int n_masking_steps = (!Is_causal && !Is_local)
+        // 非因果掩码和非局部Attention,则仅最后一个BlockTile需要Mask检查
         ? 1
+        // MN维度是BlockTile大小的整倍数且因果掩码,则需要`ceil_div(kBlockM, kBlockN)`个需要Mask检查(考虑瘦高形状的BlockTile,因果掩码会分到多个BlockTile中)
+        // MN维度不是是BlockTile大小的整倍数,则需要额外一个BlockTile的Mask检查
         : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
+    // 需要Mask检查的n_masking_steps个BlockTile计算
     #pragma unroll
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
+        // MMA=4是因为acc_s是fp32数据类型
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
+        // 确保矩阵K G->S 拷贝完毕
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
 
+        // V G->S (VCPY,VCPY_N,VCPY_K)
         // Advance gV
         if (masking_step > 0) {
+            // 矩阵V的非最后一个BlockTile,需要在计算时Mask检查,但是数据都有效因此拷贝时无需边界检查
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
-        } else {
+        } else {    // masking_step == 0
+            // 矩阵V的最后一个BlockTile,矩阵V的序列长度可能在BlockTile的N维度内部,
+            // 因此要在N维度进行范围检查(`copy()`的最后一个参数),同时对于越界部分需要置0
             // Clear the smem tiles to account for predicated off loads
             FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
                 gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
@@ -316,6 +346,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
         cute::cp_async_fence();
 
+        // S=Q*K^T  (kBlockM,kHeadDim)x(kBlockN,kHeadDim)=(kBlockM,kBlockN)
         FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
@@ -325,30 +356,42 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
         }
 
+        // 掩码操作,将不参与计算的位置置为负无穷
         mask.template apply_mask<Is_causal, Is_even_MN>(
-            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+            acc_s, 
+            // 当前线程块的对应的`acc_s`的行偏移(具体线程的偏移在函数内部计算)
+            /*col_idx_offset_=*/n_block * kBlockN, 
+            // `tidx/32`为warp_id, `*16`是因为TiledMMA中每个warp的M维度占16行, `tidx % 32`为lane_id, `/4`是因为MMAAtom中4个线程占1行
+            // 最终计算得到的即为当前线程的对应的`acc_s`的行偏移
+            // ref: https://docs.nvidia.com/cuda/parallel-thread-execution/#mma-16816-c
+            /*row_idx_offset=*/m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, 
+            /*warp_row_stride=*/kNWarps * 16    // TiledMMA的单次计算的M维度大小
         );
 
+        // 确保矩阵V G->S 拷贝完毕
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
         if (n_block > n_block_min) {
+            // K G->S (KCPY,KCPY_N,KCPY_K)
+            // `n_block - 1`是因为循环外prologue提前发起了1个拷贝操作
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
             cute::cp_async_fence();
         }
 
+        // P=softmax(S)
         // TODO: when we have key_padding_mask we'll need to Check_inf
         masking_step == 0
             ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2)
             : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
         // Convert acc_s from fp32 to fp16/bf16
-        Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
+        Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);  // (MMA=4, MMA_M, MMA_N)
         int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
         int block_col_idx = n_block * (kBlockN / 32);
         if (Return_softmax) {
-            Tensor rP_drop = make_fragment_like(rP);
+            Tensor rP_drop = make_fragment_like(rP);    // (MMA=4, MMA_M, MMA_N)
             cute::copy(rP, rP_drop);
             dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
                 rP_drop, block_row_idx, block_col_idx, kNWarps
@@ -360,13 +403,19 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             dropout.apply_dropout(rP, block_row_idx, block_col_idx, kNWarps);
         }
 
+        // 调整rP以满足MMA中矩阵A的layout
         // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
         // if (cute::thread0()) { print(tOrP); }
+        // O=PV  (kBlockM,kBlockN)x(kHeadDim,kBlockN)=(kblockM,kHeadDim)
+        // 注意这里使用的是"Vt",即矩阵V的转置,因为CuTe的GEMM中矩阵B是(N,K)的表示即内部将矩阵B转置进行计算,
+        //     此处实际计算要求矩阵V不能转置,因此需要提供给CuTe转置的矩阵V,内部再进行一次转置相当于未转置
+        // "rs"表示矩阵A(矩阵P)来自于REG,而矩阵B(矩阵V)来自于GMEM
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
         // if (cute::thread0()) { print(scores); }
 
+        // 局部Attention时的提前终止
         // This check is at the end of the loop since we always have at least 1 iteration
         if (n_masking_steps > 1 && n_block <= n_block_min) {
             --n_block;
@@ -378,11 +427,15 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     for (; n_block >= n_block_min; --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
+        // 确保矩阵K G->S 拷贝完毕
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
+        // V G->S (VCPY,VCPY_N,VCPY_K)
+        // 不为需要Mask/边界检查的分块,可以直接拷贝
         FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
         cute::cp_async_fence();
 
+        // S=Q*K^T 
         FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
@@ -391,26 +444,31 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
         }
 
+        // 确保矩阵V G->S 拷贝完毕
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
         if (n_block > n_block_min) {
+            // 拷贝下一轮循环的矩阵K G->S
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
             cute::cp_async_fence();
         }
 
+        // 掩码操作,此处无需因果掩码处理
         mask.template apply_mask</*Causal_mask=*/false>(
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
         );
 
+        // P=softmax(S)
         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
-        Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
+        // Convert acc_s from fp32 to fp16/bf16
+        Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);  // (MMA=4, MMA_M, MMA_N)
         int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
         int block_col_idx = n_block * (kBlockN / 32);
         if (Return_softmax) {
-            Tensor rP_drop = make_fragment_like(rP);
+            Tensor rP_drop = make_fragment_like(rP);    // (MMA=4, MMA_M, MMA_N)
             cute::copy(rP, rP_drop);
             dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
                 rP_drop, block_row_idx, block_col_idx, kNWarps
@@ -425,25 +483,36 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
+        // O=PV
+        // O_j=e^{m_{j-1}-m_j}*O_{j-1}+P_jV_j (其中前一项在`softmax_rescale_o`完成)
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
     }
 
     // Epilogue
 
+    // (2*MMA_M,)
     Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout);
 
     // Convert acc_o from fp32 to fp16/bf16
     Tensor rO = FLASH_NAMESPACE::convert_type<Element>(acc_o);
+    // 复用矩阵Q的SMEM (kBlockM,kHeadDim)
     Tensor sO = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutO{});    // (SMEM_M,SMEM_N)
     // Partition sO to match the accumulator partitioning
     auto smem_tiled_copy_O = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomO{}, tiled_mma);
     auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
+    // taccOrO: ((_1,(_4,_2)),_2,_8):((_0,(_1,_8)),_4,_16)
     Tensor taccOrO = smem_thr_copy_O.retile_S(rO);        // ((Atom,AtomNum), MMA_M, MMA_N)
+    // taccOsO: ((_1,(_2,_2,_2)),_2,((_2,_2),_2)):((_0,(_1,_512,8)),_4096,((16,32),_8192)) 
     Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
 
     // sO has the same size as sQ, so we don't need to sync here.
     if (Kernel_traits::Share_Q_K_smem) { __syncthreads(); }
 
+    // [QTS] `smem_tiled_copy_O`使用的是`AutoVectorizingCopyWithAssumedAlignment<128>`,
+    //       即128比特的向量化访存,但此处实际上应该达不到128比特
+    //       `taccOrO`的layout为((_1,(_4,_2)),_2,_8):((_0,(_1,_8)),_4,_16)
+    //       这里似乎只有4个元素连续,即实际为fp16x4的向量化访存?
+    // O R->S
     cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
 
     Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr)
@@ -452,28 +521,34 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                             make_stride(params.o_row_stride, params.o_head_stride, _1{}));
     Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                            make_coord(m_block, 0));  // (kBlockM, kHeadDim)
+    // (kBlockM,)
     Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
 
     typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
     auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
+    // tOsO: ((_1,_8),_8,_2):((_0,_1),_1024,_8192)
     Tensor tOsO = gmem_thr_copy_O.partition_S(sO);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
-    Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
+    // tOgO: ((_1,_8),_8,_2):((_0,_1),7680,_64)
+    Tensor tOgO = gmem_thr_copy_O.partition_D(gO);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
 
     __syncthreads();
 
+    // tOrO: ((_1,_8),_8,_2):((_0,_1),_8,_64)
     Tensor tOrO = make_tensor<Element>(shape(tOgO));
+    // O S->R
     cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
 
     Tensor caccO = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});    // (BLK_M,BLK_K) -> (blk_m,blk_k)
     Tensor taccOcO = thr_mma.partition_C(caccO);                           // (MMA,MMA_M,MMA_K)
     static_assert(decltype(size<0>(taccOcO))::value == 4);
     // Convert to ((2, 2), MMA_M, MMA_K) then take only the row indices.
-    Tensor taccOcO_row = logical_divide(taccOcO, Shape<_2>{})(make_coord(0, _), _, 0);
-    CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));                     // MMA_M
-    if (get<1>(taccOcO_row(0)) == 0) {
+    Tensor taccOcO_row = logical_divide(taccOcO, Shape<_2>{})(make_coord(0, _), _, 0);  // (2,MMA_M)
+    CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));                     // 2*MMA_M
+    if (get<1>(taccOcO_row(0)) == 0) {  // 确保每行的行首线程处理
         #pragma unroll
-        for (int mi = 0; mi < size(lse); ++mi) {
+        for (int mi = 0; mi < size(lse); ++mi) {    // 2*MMA_M
             const int row = get<0>(taccOcO_row(mi));
+            // 将矩阵Q有效序列长度内的LSE逐元素写回GMEM
             if (row < binfo.actual_seqlen_q - m_block * kBlockM) { gLSE(row) = lse(mi); }
         }
     }
@@ -482,11 +557,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor cO = make_identity_tensor(make_shape(size<0>(sO), size<1>(sO)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
     // Repeat the partitioning with identity layouts
     Tensor tOcO = gmem_thr_copy_O.partition_D(cO);                           // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
-    Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
+    Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO))); // MMA_K
     if (!Is_even_K) {
         #pragma unroll
         for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
     }
+    // O R->G
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
         gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
@@ -1088,6 +1164,7 @@ inline __device__ void compute_attn(const Params &params) {
     // the attention matrix. This way, as long as we have the batch, head, and the location of
     // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
 
+    // 计算单行Attention (指定batch_idx/q_seq/head_idx)
     FLASH_NAMESPACE::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params, bidb, bidh, m_block);
 }
 

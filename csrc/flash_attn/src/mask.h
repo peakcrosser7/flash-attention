@@ -127,7 +127,7 @@ struct Mask {
 
     // Causal_mask: whether this particular iteration needs causal masking
     template <bool Causal_mask=false, bool Is_even_MN=true, typename Engine, typename Layout>
-    __forceinline__ __device__ void apply_mask(Tensor<Engine, Layout> &tensor_,
+    __forceinline__ __device__ void apply_mask(Tensor<Engine, Layout> &tensor_,     // (MMA=4, MMA_M, MMA_N)
                                                const int col_idx_offset_,
                                                const int row_idx_offset,
                                                const int warp_row_stride) {
@@ -137,18 +137,22 @@ struct Mask {
         static constexpr bool Need_masking = Has_alibi || Causal_mask || Is_local || !Is_even_MN;
         // if (cute::thread0()) { printf("Has_alibi = %d, Causal_mask=%d, Is_local=%d, Is_even_MN = %d, Need_masking = %d\n", Has_alibi, Causal_mask, Is_local, Is_even_MN, Need_masking); }
         if constexpr (Need_masking) {
+            // `tensor_`是按照MMA的layout表示形式,此处转化为`(nrow=(2, MMA_M), ncol=(2, MMA_N))`后,
+            // 第1个mode均表示行维度,第2个mode均表示列维度,便于后续按行列迭代
             // Reshape tensor_ from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
             Tensor tensor = make_tensor(tensor_.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(tensor_.layout()));
             // Do we need both row and column indices, or just column incides?
             static constexpr bool Col_idx_only = !(Has_alibi && !Is_causal) && !Is_local && !Causal_mask;
             const int lane_id = threadIdx.x % 32;
+            // `lane_id%4`为lane在MMA的分组序号,`*2`是因为每个lane负责2个元素(2列)
+            // ref: https://docs.nvidia.com/cuda/parallel-thread-execution/#mma-16816-c
             const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
             if constexpr (Col_idx_only) {
                 #pragma unroll
-                for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
-                    const int col_idx_base = col_idx_offset + nj * 8;
+                for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {   // MMA_N
+                    const int col_idx_base = col_idx_offset + nj * 8;   // `*8`是因为MMAAtom的N维度大小为8
                     #pragma unroll
-                    for (int j = 0; j < size<1, 0>(tensor); ++j) {
+                    for (int j = 0; j < size<1, 0>(tensor); ++j) {  // 2
                         const int col_idx = col_idx_base + j;
                         #pragma unroll
                         for (int mi = 0; mi < size<0>(tensor); ++mi) {
@@ -157,6 +161,7 @@ struct Mask {
                                 tensor(mi, make_coord(j, nj)) += alibi_slope * col_idx;
                             }
                             if constexpr (!Is_even_MN) {
+                                // 将Mask外的位置设置为负无穷
                                 if (col_idx >= max_seqlen_k) { tensor(mi, make_coord(j, nj)) = -INFINITY; }
                             }
                         }
@@ -164,18 +169,20 @@ struct Mask {
                 }
             } else {
                 #pragma unroll
-                for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
+                for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {   // MMA_M
                     const int row_idx_base = row_idx_offset + mi * warp_row_stride;
                     #pragma unroll
-                    for (int i = 0; i < size<0, 0>(tensor); ++i) {
+                    for (int i = 0; i < size<0, 0>(tensor); ++i) {  // 2
+                        // `*8`是因为MMAAtom中按行分为两组每组8行
+                        // ref: https://docs.nvidia.com/cuda/parallel-thread-execution/#mma-16816-c
                         const int row_idx = row_idx_base + i * 8;
                         const int col_idx_limit_left = std::max(0, row_idx + max_seqlen_k - max_seqlen_q - window_size_left);
                         const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q + window_size_right);
                         #pragma unroll
-                        for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
-                            const int col_idx_base = col_idx_offset + nj * 8;
+                        for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {   // MMA_N
+                            const int col_idx_base = col_idx_offset + nj * 8;   // `*8`是因为MMAAtom的N维度大小为8
                             #pragma unroll
-                            for (int j = 0; j < size<1, 0>(tensor); ++j) {
+                            for (int j = 0; j < size<1, 0>(tensor); ++j) {  // 2
                                 const int col_idx = col_idx_base + j;
                                 if constexpr (Has_alibi) {
                                     if constexpr (Is_causal) {

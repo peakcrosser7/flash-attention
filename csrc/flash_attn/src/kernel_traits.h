@@ -19,6 +19,7 @@ struct Flash_kernel_traits {
     using Element = elem_type;
     static constexpr bool Has_cp_async = true;
 #else
+    // SM<8.0只支持fp16数据类型且不支持cp.async指令
     using Element = cutlass::half_t;
     static constexpr bool Has_cp_async = false;
 #endif
@@ -36,10 +37,13 @@ struct Flash_kernel_traits {
     using MMA_Atom_Arch = MMA_Atom<SM75_16x8x8_F32F16F16F32_TN>;
 #endif
 
+    // S->R
 #if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 750
+    // ldmatrix指令的拷贝
     using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
     using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, elem_type>;
 #else
+    // 向量化访存的拷贝,即UniversalCopy
     using SmemCopyAtom = Copy_Atom<DefaultCopy, elem_type>;
     using SmemCopyAtomTransposed = Copy_Atom<DefaultCopy, elem_type>;
 #endif
@@ -67,13 +71,20 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kBlockN = kBlockN_;
     static constexpr int kHeadDim = kHeadDim_;
     static_assert(kHeadDim % 32 == 0);
+    // SMEM中一行的宽度
     static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
+    // GMEM中一行的宽度
     static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
+    // BBits in SMEM-swizzle
+    // 由于FA的输入是FP16/BF16,因此SBits和MBits均为2
+    // 按公式 (log2(size(layout))-M-S)=2 <= BBits <= S=3 可得`kBlockKSmem == 32 ? 2 : 3`
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
 
     using TiledMma = TiledMMA<
         typename Base::MMA_Atom_Arch,
+        // thr_layout: warp都在M维度上排布
         Layout<Shape<Int<kNWarps>,_1,_1>>,  // 4x1x1 or 8x1x1 thread group
+        // permutations: TiledMMA计算的数据分片大小
         Tile<Int<16 * kNWarps>, _16, _16>>;
 
     using SmemLayoutAtomQ = decltype(
@@ -81,23 +92,28 @@ struct Flash_fwd_kernel_traits : public Base {
                     // This has to be kBlockKSmem, using kHeadDim gives wrong results for d=128
                     Layout<Shape<_8, Int<kBlockKSmem>>,
                            Stride<Int<kBlockKSmem>, _1>>{}));
+    // (kBlockM,kHeadDim)
     using SmemLayoutQ = decltype(tile_to_shape(
         SmemLayoutAtomQ{},
         Shape<Int<kBlockM>, Int<kHeadDim>>{}));
 
+    // (kBlockM,kHeadDim)
     using SmemLayoutKV = decltype(tile_to_shape(
         SmemLayoutAtomQ{},
         Shape<Int<kBlockN>, Int<kHeadDim>>{}));
 
+    // (kHeadDim,kBlockM)
     // https://github.com/ColfaxResearch/cutlass-kernels/blob/a222587e6d59b93ba704853d3946fb686d8b8892/src/fmha/fmha_forward.cu#L434
     using SmemLayoutVtransposed = decltype(
         composition(SmemLayoutKV{}, make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
     using SmemLayoutVtransposedNoSwizzle = decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
 
+    // 矩阵O与矩阵Q一致
     using SmemLayoutAtomO = decltype(
         composition(Swizzle<kSwizzle, 3, 3>{},
                     Layout<Shape<Int<8>, Int<kBlockKSmem>>,
                            Stride<Int<kBlockKSmem>, _1>>{}));
+    // (kBlockM,kHeadDim)
     using SmemLayoutO = decltype(tile_to_shape(
         SmemLayoutAtomO{},
         Shape<Int<kBlockM>, Int<kHeadDim>>{}));
@@ -108,8 +124,10 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kSmemKVSize = size(SmemLayoutKV{}) * 2 * sizeof(Element);
     static constexpr int kSmemSize = Share_Q_K_smem ? std::max(kSmemQSize, kSmemKVSize) : kSmemQSize + kSmemKVSize;
 
+    // 每次GMEM向量化读取的数据个数
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");
+    // GMEM每行的线程数
     // Using kBlockKSmem here is 6-10% faster than kBlockKGmem for d=128 because of bank conflicts.
     // For example, for d=128, smem is split into 2 "pages", each page takes care of columns
     // 0-63 and 64-127. If we have 16 threads per row for gmem read, when we write to smem,
@@ -117,9 +135,12 @@ struct Flash_fwd_kernel_traits : public Base {
     // to the same banks.
     static constexpr int kGmemThreadsPerRow = kBlockKSmem / kGmemElemsPerLoad;
     static_assert(kNThreads % kGmemThreadsPerRow == 0, "kNThreads must be a multiple of kGmemThreadsPerRow");
+    // (kNThreads/kGmemThreadsPerRow, kGmemThreadsPerRow):(kGmemThreadsPerRow,_1) 相当于k-major
     using GmemLayoutAtom = Layout<Shape <Int<kNThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                                   Stride<Int<kGmemThreadsPerRow>, _1>>;
 
+    // G->S 拷贝操作
+    // QKV只加载一次,因此仅需在L2-Cache层面缓存无需L1-Cache缓存,因此使用CACHEGLOBAL
     // We use CACHEGLOBAL instead of CACHEALWAYS for both Q and K/V, since we won't be reading
     // from the same address by the same threadblock. This is slightly faster.
     using Gmem_copy_struct = std::conditional_t<

@@ -16,7 +16,8 @@ else:
 
 # isort: on
 
-def maybe_contiguous(x):
+def maybe_contiguous(x: torch.Tensor | None) -> torch.Tensor | None:
+    """将张量转化为连续的张量,如果已经是连续的则返回原张量"""
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
@@ -1578,8 +1579,9 @@ def flash_attn_with_kvcache(
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** (-0.5)
+        softmax_scale = q.shape[-1] ** (-0.5)   # 1 / sqrt(headdim)
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
+        # 扩展为 (batch_size,) 的张量
         cache_seqlens = torch.full(
             (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )

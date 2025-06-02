@@ -29,7 +29,7 @@ struct Qkv_params {
     index_t q_batch_stride;
     index_t k_batch_stride;
     index_t v_batch_stride;
-    index_t q_row_stride;
+    index_t q_row_stride;   // seqlen_stride
     index_t k_row_stride;
     index_t v_row_stride;
     index_t q_head_stride;
@@ -37,6 +37,7 @@ struct Qkv_params {
     index_t v_head_stride;
 
     // The number of heads.
+    // Q-head数, KV-head数
     int h, h_k;
     // In the case of multi-query and grouped-query attention (MQA/GQA), nheads_k could be
     // different from nheads (query).
@@ -64,24 +65,41 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ softmax_lseaccum_ptr;
 
     // The dimensions.
-    int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim, total_q;
+    int b;  // batch_size
+    int seqlen_q;   // 矩阵Q序列长度
+    int seqlen_k;   // 矩阵KV序列长度/KVCache的序列长度(不包括新产生的KVCache)
+    int seqlen_knew;    // 新产生的KVCache的序列长度
+    int d;
+    int seqlen_q_rounded; 
+    int seqlen_k_rounded; 
+    int d_rounded; 
+    int rotary_dim;
+    int total_q;
 
     // The scaling factors for the kernel.
     float scale_softmax;
     float scale_softmax_log2;
 
+    // 用于处理序列变长的一批次矩阵QKV,一批次内每个矩阵在序列维度进行拼接,
+    //   因此这里相当于存储的该批次序列的序列长度的前缀和,对于某个batch_idx的序列实际长度需要相邻作差得到
     // array of length b+1 holding starting offset of each sequence.
+    // 累计的矩阵Q的序列长度 (batch_size+1,)
     int * __restrict__ cu_seqlens_q;
+    // 矩阵K/V的序列长度 (batch_size+1,)
     int * __restrict__ cu_seqlens_k;
+    // KVCache的序列起始位置 (batch_size,)
     int * __restrict__ leftpad_k;
 
+    // 实际使用的矩阵KV的序列长度 (batch_size,)
     // If provided, the actual length of each k sequence.
     int * __restrict__ seqused_k;
 
     int *__restrict__ blockmask;
 
     // The K_new and V_new matrices.
+    // 新产生的矩阵K (batch_size,seqlen_knew,num_heads_k,head_size)
     void * __restrict__ knew_ptr;
+    // 新产生的矩阵V (batch_size,seqlen_knew,num_heads_k,head_size)
     void * __restrict__ vnew_ptr;
 
     // The stride between rows of the Q, K and V matrices.
@@ -125,19 +143,23 @@ struct Flash_fwd_params : public Qkv_params {
     uint64_t * rng_state;
 
     bool is_bf16;
+    // 因果掩码Attention计算
     bool is_causal;
 
+    // 判断`seqlen_k`是否是累计形式
     // If is_seqlens_k_cumulative, then seqlen_k is cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb].
     // Otherwise it's cu_seqlens_k[bidb], i.e., we use cu_seqlens_k to store the sequence lengths of K.
     bool is_seqlens_k_cumulative;
 
     bool is_rotary_interleaved;
 
+    // KVCache在序列长度维度划分的chunk数,即Split-KV (与GEMM的Split-K相同)
     int num_splits;  // For split-KV version
 
     void * __restrict__ alibi_slopes_ptr;
     index_t alibi_slopes_batch_stride;
 
+    // 是否为非填充的LSE(shape(nheads, total_seqlen_q) if true else (b, nheads, seqlen_q))
     bool unpadded_lse;  // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
     bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
 };

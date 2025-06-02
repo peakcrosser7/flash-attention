@@ -28,6 +28,8 @@ namespace FLASH_NAMESPACE {
 #define DEFINE_FLASH_FORWARD_KERNEL(kernelName, ...) \
 template<typename Kernel_traits, __VA_ARGS__> \
 __global__ void kernelName(KERNEL_PARAM_MODIFIER const Flash_fwd_params params)
+// 使用`__grid_constant__`从而使`params`存于GPU的constant-cache各线程共享,而非线程各自具有一个副本,这要求`params`必须只读
+// Ref: https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#grid-constant
 
 DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_kernel, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax) {
     #if defined(ARCH_SUPPORTS_FLASH)
@@ -51,6 +53,7 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_combine_kernel, int kBlockM, int L
     FLASH_NAMESPACE::combine_attn_seqk_parallel<Kernel_traits, kBlockM, Log_max_splits, Is_even_K>(params);
 }
 
+// 不启用Split-KV的FlashAttention-2
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
@@ -60,9 +63,16 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // https://github.com/kokkos/kokkos-kernels/issues/349
     // https://github.com/HazyResearch/flash-attention/issues/21
 
+    // FlashAttention-2同时在矩阵Q的序列长度维度线程块并行
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
+    // 在矩阵Q序列长度维度/batch_size维度/Attention头数维度线程块并行
     dim3 grid(num_m_block, params.b, params.h);
-    const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_k % Kernel_traits::kBlockN == 0 && params.seqlen_q % Kernel_traits::kBlockM == 0;
+    // MN维度可被线程块数据分块的MN大小整除
+    const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr 
+                            && params.seqlen_k % Kernel_traits::kBlockN == 0 
+                            && params.seqlen_q % Kernel_traits::kBlockM == 0;
+    
+    // K维度(head_size维度)恰好相等
     const bool is_even_K = params.d == Kernel_traits::kHeadDim;
     const bool return_softmax = params.p_ptr != nullptr;
     BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
@@ -233,6 +243,7 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
             // and 128 x 32 (48 KB smem) is the fastest for non-causal since we get 2 CTAs per SM.
             if (is_sm8x) {
                 if constexpr(!Is_causal) {
+                    //                                    kHeadDim_,kBlockM_,kBlockN_,kNWarps_,Is_Q_in_regs_,Share_Q_K_smem_,elem_type
                     run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
                 } else {
                     run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);

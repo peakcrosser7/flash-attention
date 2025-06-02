@@ -78,8 +78,8 @@ void set_params_fprop(Flash_fwd_params &params,
         params.v_batch_stride = v.stride(0);
         params.o_batch_stride = out.stride(0);
         if (seqlenq_ngroups_swapped) {
-             params.q_batch_stride *= seqlen_q;
-             params.o_batch_stride *= seqlen_q;
+            params.q_batch_stride *= seqlen_q;
+            params.o_batch_stride *= seqlen_q;
         }
     }
 
@@ -109,7 +109,7 @@ void set_params_fprop(Flash_fwd_params &params,
     #ifdef FLASHATTENTION_DISABLE_SOFTCAP
         TORCH_CHECK(softcap <= 0.0, "This flash attention build does not support softcap.");
     #endif
-    if (softcap > 0.0) {
+    if (softcap > 0.0) {    // soft-capping attention
         params.softcap = softmax_scale / softcap;
         params.scale_softmax = softcap;
         params.scale_softmax_log2 = softcap * M_LOG2E;
@@ -262,9 +262,10 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
 // of the best efficiency.
 inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits) {
     // If we have enough to almost fill the SMs, then just use 1 split
+    // `batch_nheads_mblocks`表示batch和head维度需要的线程块数量
     if (batch_nheads_mblocks >= 0.8f * num_SMs) { return 1; }
     max_splits = std::min({max_splits, num_SMs, num_n_blocks});
-    float max_efficiency = 0.f;
+    float max_efficiency = 0.f; // 记录当前最大SM占用率
     std::vector<float> efficiency;
     efficiency.reserve(max_splits);
     auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
@@ -273,12 +274,14 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n
     // (i.e. it's 11 splits anyway).
     // So we check if the number of blocks per split is the same as the previous num_splits.
     auto is_split_eligible = [&ceildiv, &num_n_blocks](int num_splits) {
+        // 若当前划分数与上一划分数得到相同的结果则为无效划分
         return num_splits == 1 || ceildiv(num_n_blocks, num_splits) != ceildiv(num_n_blocks, num_splits - 1);
     };
     for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
         if (!is_split_eligible(num_splits)) {
             efficiency.push_back(0.f);
         } else {
+            // wave数=总共需要的线程块数/SM数
             float n_waves = float(batch_nheads_mblocks * num_splits) / num_SMs;
             float eff = n_waves / ceil(n_waves);
             // printf("num_splits = %d, eff = %f\n", num_splits, eff);
@@ -286,6 +289,8 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n
             efficiency.push_back(eff);
         }
     }
+    // 找到一个划分数最少且占用率达到85%最大占用率的划分数
+    // 不选择最大占用率的划分是因为序列长度维度划分越多,需要重复读取的KVCache越多
     for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
         if (!is_split_eligible(num_splits)) { continue; }
         if (efficiency[num_splits - 1] >= 0.85 * max_efficiency) {
@@ -303,9 +308,11 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
 
     // This needs to match with run_mha_fwd_splitkv_dispatch
     const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
+    // N维度(KV-seqlen维度)需要的线程块数量
     const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
     // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
     // In any case we don't expect seqlen_q to be larger than 64 for inference.
+    // M维度(Q-seqlen维度)需要的线程块数量
     const int num_m_blocks = (max_seqlen_q + 64 - 1) / 64;
     params.num_splits = num_splits;
     at::Tensor softmax_lse_accum;
@@ -1217,9 +1224,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 bool is_causal,
                 int window_size_left,
                 int window_size_right,
-                const float softcap,
+                const float softcap,    // > 0 activates softcapping attention.
                 bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-                int num_splits
+                int num_splits  // split the key/value into this many chunks along the sequence
                 ) {
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -1254,15 +1261,20 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     const auto sizes = q.sizes();
 
     const int batch_size = sizes[0];
+    // Q的序列长度
     int seqlen_q = sizes[1];
+    // Q的head数目
     int num_heads = sizes[2];
+    // Q的原始head_size
     const int head_size_og = sizes[3];
 
     const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
     const int num_blocks = !paged_KV ? 0 : kcache.size(0);
     const int page_block_size = !paged_KV ? 1 : kcache.size(1);
     TORCH_CHECK(!paged_KV || page_block_size % 256 == 0, "Paged KV cache block size must be divisible by 256");
+    // K/V的序列长度
     const int seqlen_k = !paged_KV ? kcache.size(1) : max_num_blocks_per_seq * page_block_size;
+    // KV的head数目
     const int num_heads_k = kcache.size(2);
     const int batch_size_c = !paged_KV ? kcache.size(0) : batch_size;
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
@@ -1275,7 +1287,10 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
-    const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && head_size_og % 8 == 0 && !alibi_slopes_.has_value();
+    const int seqlenq_ngroups_swapped = seqlen_q == 1   // decode阶段
+                                        && num_heads > num_heads_k  // 启用了GQA  
+                                        && window_size_left < 0 && window_size_right < 0    // 未启用滑动窗口
+                                        && head_size_og % 8 == 0 && !alibi_slopes_.has_value(); // 未启用Alibi位置编码
     if (seqlenq_ngroups_swapped) {
         const int ngroups = num_heads / num_heads_k;
         q = q.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2);
@@ -1286,6 +1301,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     if (window_size_left >= seqlen_k) { window_size_left = -1; }
     if (window_size_right >= seqlen_k) { window_size_right = -1; }
 
+    // QKV的shape
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_og);
     if (!paged_KV) {
         CHECK_SHAPE(kcache, batch_size_c, seqlen_k, num_heads_k, head_size_og);
@@ -1298,6 +1314,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     at::Tensor q_padded, kcache_padded, vcache_padded;
     if (head_size_og % 8 != 0) {
+        // 填充使得实际head_size为8的倍数
+        // `PadFuncOptions()`:指定在最后几个维度首尾分别填充的元素个数
+        //                    输入只有一个数对,则此处只填充最后一个维度(`head_size`维度)
         q_padded = torch::nn::functional::pad(q, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
         kcache_padded = torch::nn::functional::pad(kcache, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
         vcache_padded = torch::nn::functional::pad(vcache, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
@@ -1307,6 +1326,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         vcache_padded = vcache;
     }
 
+    // 分配/调整计算输出的张量
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
@@ -1319,7 +1339,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         out = torch::empty_like(q_padded);
     }
 
+    // 将x向上舍入到最接近的m的倍数
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    // 通过上面的填充QKV的`head_size`已经满足8的倍数的要求
     const int head_size = round_multiple(head_size_og, 8);
     const int head_size_rounded = head_size <= 192 ? round_multiple(head_size, 32) : 256;
     const int seqlen_q_rounded = round_multiple(seqlen_q, 128);
@@ -1327,6 +1349,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     auto opts = q.options();
 
+    // 用于softmax的log-sum-exp L_i=m_i+log(l_i) (batch_size, num_heads, seqlen_q)
     auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
 
     Flash_fwd_params params;
@@ -1346,13 +1369,15 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      softmax_scale,
                      window_size_left,
                      window_size_right,
-                     softcap
+                     softcap,
+                     /*unpadded_lse=*/false
                      );
 
     at::Tensor k, v, k_padded, v_padded;
     if (k_.has_value()) {
         TORCH_CHECK(v_.has_value(), "If key is supplied, value must also be passed in");
         TORCH_CHECK(seqlens_k_.has_value(), "If key is supplied, seqlens_k must also be passed in");
+        // 这里应该是确保KVCache有足够空间写入新的KVCache
         TORCH_CHECK(seqlen_q <= seqlen_k, "If key is supplied, it must have seqlen <= the seqlen of the KV cache");
         k = k_.value();
         v = v_.value();
@@ -1391,7 +1416,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         CHECK_SHAPE(seqlens_k, batch_size);
         params.cu_seqlens_k = static_cast<int *>(seqlens_k.data_ptr());
     }
+    // 如果`seqlens_k_`有值则其不是累计形式可直接访问得到序列长度
     params.is_seqlens_k_cumulative = !(seqlens_k_.has_value());
+    // KVCache的起始索引
     if (leftpad_k_.has_value()) {
         TORCH_CHECK(!paged_KV, "We don't support Paged KV and leftpad_k running at the same time yet");
         auto leftpad_k = leftpad_k_.value();
@@ -1428,6 +1455,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         params.rotary_dim = 0;
     }
 
+    // KVCache的批次索引
     if (cache_batch_idx_.has_value()) {
         auto cache_batch_idx = cache_batch_idx_.value();
         CHECK_DEVICE(cache_batch_idx);

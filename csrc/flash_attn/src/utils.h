@@ -110,6 +110,7 @@ __device__ __forceinline__ T operator()(T const & x, T const & y) { return x + y
 
 template<int THREADS>
 struct Allreduce {
+    // sub-warp内的归约
     static_assert(THREADS == 32 || THREADS == 16 || THREADS == 8 || THREADS == 4);
     template<typename T, typename Operator>
     static __device__ __forceinline__ T run(T x, Operator &op) {
@@ -147,10 +148,12 @@ __forceinline__ __device__ void gemm(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB,
     CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // M
     Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+    // first tile of AB S->R  (MMA,MMA_M)
+    // 提前发出一个copy操作(ldmatrix指令),从而在下面循环中实现copy和gemm的overlap
     if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{})); }
     if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{})); }
     #pragma unroll
-    for (int i = 0; i < size<2>(tCrA); ++i) {
+    for (int i = 0; i < size<2>(tCrA); ++i) {   // MMA_K
         if (i < size<2>(tCrA) - 1) {
             if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i + 1), tCrA_copy_view(_, _, i + 1)); }
             if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1)); }
@@ -173,7 +176,7 @@ __forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tC
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
     cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
     #pragma unroll
-    for (int i = 0; i < size<2>(tCrA); ++i) {
+    for (int i = 0; i < size<2>(tCrA); ++i) {   // MMA_K
         if (i < size<2>(tCrA) - 1) {
             cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
         }
@@ -204,8 +207,16 @@ __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
     constexpr int mma_shape_K = get<2>(typename MMA_traits::Shape_MNK{});
     static_assert(mma_shape_K == 8 || mma_shape_K == 16);
     if constexpr (mma_shape_K == 8) {
+        // m16n8k8矩阵A的MMAAtom每个线程需要4个元素,已经满足
+        // ref: https://docs.nvidia.com/cuda/parallel-thread-execution/#mma-1688-a-f16
         return acc_layout;
     } else {
+        // m16n8k16矩阵A的MMAAtom每个线程需要8个元素,因此需要
+        // `acc_layout`初始对应矩阵C的layout (ref: https://docs.nvidia.com/cuda/parallel-thread-execution/#mma-16816-c)
+        //   MMAAtom的每个线程元素的shape是(2,2)分别是(N维度,M维度)
+        // 由于`acc_layout`在Attention中又需要作为A矩阵 (ref: https://docs.nvidia.com/cuda/parallel-thread-execution/#mma-16816-a-f16)
+        //   MMAAtom的每个线程元素的shape是(2,2,2)分别是(N维度,M维度,N维度)
+        // 因此需要将MMA_N维度除2分给MMA作为第3个mode
         auto l = logical_divide(acc_layout, Shape<X, X, _2>{});  // (4, MMA_M, (2, MMA_N / 2)))
         return make_layout(make_layout(get<0>(l), get<2, 0>(l)), get<1>(l), get<2, 1>(l));
     }
@@ -307,10 +318,12 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
     // There's no case where !Clear_OOB_K && Clear_OOB_MN
     static_assert(!(Clear_OOB_MN && !Clear_OOB_K));
     #pragma unroll
-    for (int m = 0; m < size<1>(S); ++m) {
+    for (int m = 0; m < size<1>(S); ++m) {  // MMA_M
+        // FlashAttention所有TiledCopy的thr_layout在行维度大小均为1,所以不会出现MMA中有多行的情况
+        // `size<1>(S)`表示的即为行数, 因此这里是逐行进行边界检查,
         if (Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN) {
             #pragma unroll
-            for (int k = 0; k < size<2>(S); ++k) {
+            for (int k = 0; k < size<2>(S); ++k) {  // MMN_K
                 if (Is_even_K || predicate_K(k)) {
                     cute::copy(tiled_copy, S(_, m, k), D(_, m, k));
                 } else if (Clear_OOB_K) {
