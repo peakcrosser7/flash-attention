@@ -6,6 +6,7 @@
 
 #include <vector>
 
+// 是否对GQA进行打包
 inline bool should_pack_gqa(bool varlen_q, int seqlen_q, int qhead_per_khead, int blockM) {
     // If varlen, we don't actually know seqlen_q but only max_seqlen_q.
     if (varlen_q) return true;

@@ -54,14 +54,17 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     >;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, FP8_TransposeV>;
 
+    // 生产者线程数(进行拷贝操作的线程数)
     static constexpr int NumProducerThreads = Arch >= 90 ? CollectiveMainloop::NumProducerThreads : CollectiveMainloop::NumMmaThreads;
+    // PersistentKernel调度器
     using SchedulerPersistent = std::conditional_t<Varlen,
         flash::VarlenDynamicPersistentTileScheduler<kBlockM, CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/>,
         std::conditional_t<!Is_causal && !Is_local,
-            flash::StaticPersistentTileScheduler<Split>,
+            flash::StaticPersistentTileScheduler<Split>,    // 不启用因果掩码和局部Attention
             flash::DynamicPersistentTileScheduler<CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/>
         >
     >;
+    // 非PersistentKernel的单分片调度器
     using SchedulerSingleTile = flash::SingleTileScheduler<Varlen, Split, PackGQA, kBlockM>;
     // If Split then we probably don't have enough work for PersistentScheduler to be useful.
     // However, if Varlen (e.g., during decode where we have max_seqlens), using PersistentScheduler is better
@@ -82,7 +85,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     int batch_k = !is_varlen_k ? (params.kv_batch_idx ? params.b_k : params.b) : 1;
     typename CollectiveMainloop::StrideV v_strides =
         cute::conditional_return<!V_colmajor>(
+            // head_dim维度连续
             make_stride(params.v_row_stride, _1{}, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0),
+            // seq_len维度连续
             make_stride(_1{}, params.v_dim_stride, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0));
     typename CollectiveMainloop::Arguments mainloop_args {
         static_cast<Element const*>(params.q_ptr),
@@ -137,6 +142,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     };
 
     int qhead_per_khead = !PackGQA ? 1 : cutlass::ceil_div(params.h, params.h_k);
+    // M维度(矩阵Q序列长度维度)的线程块数目
     int num_blocks_m = cutlass::ceil_div(params.seqlen_q * qhead_per_khead, get<0>(TileShape_MNK{}));
     num_blocks_m = cutlass::round_up(num_blocks_m, size<0>(ClusterShape{}));
     typename flash::TileSchedulerArguments scheduler_args {
@@ -149,6 +155,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 
     int device;
     CHECK_CUDA(cudaGetDevice(&device));
+    // 转化为kernel输入参数
     typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments({
         mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args
     });
@@ -161,7 +168,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // int smem_size_v = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v));
     // printf("smem_size = %d, q = %d, k = %d, v = %d\n", smem_size, smem_size_q, smem_size_k, smem_size_v);
     // Get the ptr to kernel function.
-    if constexpr (size(ClusterShape{}) > 1) {
+    if constexpr (size(ClusterShape{}) > 1) {   // kernel with cluster
         void const* kernel = (void const*) cutlass::device_kernel<AttnKernel>;
         if (smem_size >= 48 * 1024) {
             CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -185,14 +192,15 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
     using T_out = std::conditional_t<!Split, std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>, float>;
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-        VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor_, [&] {
+        VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor_, [&] {   // 矩阵V是否是列主序(序列维度连续而非head_dim维度连续)
             static constexpr bool V_colmajor = V_colmajor_ && sizeof(T) == 1;
             VARLEN_SWITCH(params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k, Varlen, [&] {
                 // Only needed here to decide if we should use cluster
                 static constexpr int kBlockM = Arch >= 90 ? std::get<0>(tile_size_fwd_sm90(kHeadDim, Is_causal, Is_local, sizeof(T) /*element_size*/, V_colmajor, PagedKV, Has_softcap)) : 128;
 
+                // 启用Cluster的条件:SM90 && 特定kHeadDim && 非因果掩码 && 非局部Attention && 非SplitKV && 非分页KV && 非变长序列Attention
                 static constexpr bool Enable_cluster = Arch >= 90 && (sizeof(T) == 2 ? (kHeadDim >= 128) : (kHeadDim == 192)) && !Is_causal && !Is_local && !Split && !PagedKV && !Varlen;
-                APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
+                APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {    // 需要追加新产生的矩阵KV
                     // Only use Cluster if number of tiles along seqlen_q is even and not varlen
                     CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
                         static constexpr int ClusterM = Enable_cluster && Use_cluster ? 2 : 1;

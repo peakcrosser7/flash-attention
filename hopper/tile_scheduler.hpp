@@ -15,13 +15,20 @@ namespace flash {
 
 // Host side kernel arguments
 struct TileSchedulerArguments {
+    // M维度线程块数目
+    int const num_blocks;
     // num_head is num_head_q if not PackGQA, else num_head_k
-    int const num_blocks, num_head, num_batch, num_splits;
+    int const num_head;
+    int const num_batch, num_splits;
     int const qhead_per_khead;
+    // 矩阵Q的序列长度
     int const seqlen;  // Only used if Varlen and cu_seqlens == nullptr and seqused == nullptr
     int const seqlen_k, headdim, element_size;  // Used to calculate L2 swizzling
+    // 用于持久化调度的分片计数器信号量
     int* const tile_count_semaphore = nullptr;
+    // 矩阵Q的起始序列偏移
     int* const cu_seqlens = nullptr;
+    // 矩阵Q的实际序列长度
     int* const seqused = nullptr;
 };
 
@@ -54,14 +61,15 @@ public:
 
     static dim3
     get_grid_shape(Params const& params, int num_sm) {
+        // {M维度线程块数, Attention头数, 批次数}
         return {uint32_t(params.num_blocks), uint32_t((!Split ? 1 : params.num_splits) * params.num_head), uint32_t(params.num_batch)};
     }
 
     struct WorkTileInfo {
-        int block_idx = 0;
-        int bidh = 0;
-        int bidb = 0;
-        bool is_valid_tile = false;
+        int block_idx = 0;  // M维度线程块索引
+        int bidh = 0;   // Attention头索引
+        int bidb = 0;   // batch索引
+        bool is_valid_tile = false; // 有效标识
 
         CUTLASS_DEVICE
         bool
@@ -72,7 +80,8 @@ public:
         CUTLASS_DEVICE
         cute::tuple<int32_t, int32_t, int32_t, int32_t>
         get_block_coord(Params const& params) const {
-            if constexpr (!Split) {
+            if constexpr (!Split) { // 不启用SplitKV
+                // 直接返回线程块对应的相应索引
                 return {block_idx, bidh, bidb, 0 /*split_idx*/};
             } else {
                 int split_idx;
@@ -90,12 +99,14 @@ public:
     CUTLASS_DEVICE
     WorkTileInfo
     get_initial_work(Params const& params) const {
-        WorkTileInfo work_info {int(blockIdx.x), int(blockIdx.y), int(blockIdx.z), true};
+        // 当前线程块所在网格对应坐标
+        WorkTileInfo work_info {int(blockIdx.x), int(blockIdx.y), int(blockIdx.z), /*is_valid_tile=*/true};
         if constexpr (Varlen) {
             int seqlen = params.seqused
                 ? params.seqused[work_info.bidb]
                 : (params.cu_seqlens ? params.cu_seqlens[work_info.bidb + 1] - params.cu_seqlens[work_info.bidb] : params.seqlen);
             if constexpr (PackGQA) { seqlen *= params.qhead_per_khead; }
+            // 根据矩阵Q的序列长度来设置当前线程块是否为有效线程块
             work_info.is_valid_tile = work_info.block_idx * kBlock < seqlen;
         }
         return work_info;
@@ -113,6 +124,7 @@ public:
     CUTLASS_DEVICE
     WorkTileInfo
     get_next_work(Params const& params, WorkTileInfo const& current_work) const {
+        // 单分片调度只处理一个数据分片就退出
         return {-1, -1, -1, false};
     }
 
@@ -143,7 +155,7 @@ public:
 
     static dim3
     get_grid_shape(Params const& params, int num_sm) {
-        return {uint32_t(num_sm)};
+        return {uint32_t(num_sm)};  // 启动SM数量个线程块
     }
 
     struct WorkTileInfo {
@@ -159,6 +171,10 @@ public:
         cute::tuple<int32_t, int32_t, int32_t, int32_t>
         get_block_coord(Params const& params) const {
             int block, bidh, bidb;
+            // `FastDivmod.divmod()`: 执行 this->divisor/dividend,返回商,第一个参数`remainder`记录余数
+            // block = tile_idx % num_blocks
+            // bidh = (tile_idx / num_blocks) % num_head
+            // bidb = (tile_idx / num_blocks) / num_head
             bidb = params.head_divmod.divmod(bidh, params.m_block_divmod.divmod(block, tile_idx));
             int split_idx = 0;
             if constexpr (Split) {
@@ -176,6 +192,7 @@ public:
     CUTLASS_DEVICE
     WorkTileInfo
     get_initial_work(Params const& params) const {
+        // 初始任务为线程块ID对应的分块
         return {int(blockIdx.x)};
     }
 
@@ -191,6 +208,8 @@ public:
     CUTLASS_DEVICE
     WorkTileInfo
     get_next_work(Params const& params, WorkTileInfo const& current_work) const {
+        // 当前tile的索引+线程网格的跨度(SM数)
+        // 即静态分片调度的核心即:分配SM数的线程块,按照SM数的跨度处理数据分片
         return {current_work.tile_idx + int(gridDim.x)};
     }
 
@@ -210,6 +229,7 @@ class DynamicPersistentTileScheduler {
     // size of K & V and the L2 cache size.
 
     static_assert(WarpSpecialized || NumProducerThreads == NumMmaThreads);
+    // 总线程数 (WS ? MMA+Load线程数 : MMA线程数)
     static constexpr int NumThreads = WarpSpecialized ? NumMmaThreads + NumProducerThreads : NumMmaThreads;
 
 public:
@@ -304,7 +324,9 @@ public:
     CUTLASS_DEVICE
     void
     init_consumer() const {
+        // [QTS] 为什么warp_idx>0的时候也要执行
         if (WarpSpecialized || cutlass::canonical_warp_idx_sync() > 0) {
+            // 等待所有线程达到
             flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
         }
     }

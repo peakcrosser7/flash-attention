@@ -31,6 +31,7 @@ struct CollectiveEpilogueFwd {
     static constexpr int NumEpilogueThreads = NumEpilogueThreads_;
     static constexpr bool Varlen = Varlen_;
     static constexpr bool PackGQA = PackGQA_;
+    // 是否使用SMEM存储矩阵O(输出类型非FP32时)
     static constexpr bool Use_smem = sizeof(Element) <= 2;
     static constexpr bool Use_TMA_O = ArchTag::kMinComputeCapability >= 90 && !Varlen && Use_smem && !PackGQA;
 

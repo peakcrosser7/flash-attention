@@ -62,8 +62,21 @@ struct Flash_fwd_params : public Qkv_params {
     index_t v_descale_head_stride;
 
     // The dimensions.
-    int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim;
-    int total_q, total_k, total_knew;
+    int b;
+    int seqlen_q;
+    int seqlen_k;
+    // 新产生的矩阵KV的序列长度
+    int seqlen_knew;
+    int d;
+    int seqlen_q_rounded;
+    int seqlen_k_rounded;
+    int d_rounded;
+    int rotary_dim;
+    int total_q;
+    int total_k;
+    // 整个批次矩阵KV的序列总长度
+    int total_knew;
+    // 矩阵KV的批次大小
     int b_k;  // When having KV cache and with cache_batch_idx, K & V might have larger batch size than Q
 
     // The scaling factors for the kernel.
@@ -73,6 +86,7 @@ struct Flash_fwd_params : public Qkv_params {
     // array of length b+1 holding starting offset of each sequence.
     int * __restrict__ cu_seqlens_q;
     int * __restrict__ cu_seqlens_k;
+    // 新产生的每个序列的矩阵KV的序列长度
     int * __restrict__ cu_seqlens_knew;
     int * __restrict__ leftpad_k;
 
@@ -127,13 +141,17 @@ struct Flash_fwd_params : public Qkv_params {
 
     // Local window size
     int window_size_left, window_size_right;
+    // sink-token(StreamingLLM在序列开头的token)长度
     int sink_token_length;
 
     // Pointer to the RNG seed (idx 0) and offset (idx 1).
     uint64_t * rng_state;
 
+    // 矩阵Q是FP16类型
     bool is_bf16;
+    // 输出矩阵O是FP32类型
     bool is_fp32;
+    // 矩阵Q是FP8类型
     bool is_e4m3;
     bool is_causal;
     bool is_local;
@@ -141,11 +159,15 @@ struct Flash_fwd_params : public Qkv_params {
     bool is_rotary_interleaved;
 
     int num_splits;  // For split-KV version
+    // 是否进行GQA打包 [QTS]还未确定实际含义
     bool pack_gqa;
 
+    // 用于持久化调度的分片计数器信号量 (1,)
     int * __restrict__ tile_count_semaphore;
 
+    // GPU版本
     int arch;
+    // 实际使用的SM数
     int num_sm;
 };
 

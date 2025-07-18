@@ -34,6 +34,7 @@ struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
     using ClusterShape = ClusterShape_;
+    // BlockTile分片大小
     using TileShape_MNK = TileShape_MNK_;
     using Element = Element_;
     using ElementAccum = ElementAccum_;
@@ -47,9 +48,13 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool AppendKV = AppendKV_;
     static constexpr bool PackGQA = PackGQA_;
     static constexpr bool Split = Split_;
+    // 矩阵V列是否为列主序(序列维度连续/k-major)
     static constexpr bool V_colmajor = V_colmajor_;
+    // 需要转置矩阵V(FP8输入且矩阵V的head_dim维度连续)
     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
+    // 是否对矩阵Q使用TMA拷贝(需要矩阵Q不使用GQA打包)
     static constexpr bool Use_TMA_Q = !PackGQA;
+    // 是否对矩阵KV使用TMA拷贝(需要不为Paged的KVCache)
     static constexpr bool Use_TMA_KV = !PagedKV;
     static_assert(Use_TMA_KV || CUTE_STATIC_V(size(ClusterShape{})) == 1, "If not using TMA for KV, ClusterShape must be 1");
     static_assert(Use_TMA_KV || !V_colmajor, "If not using TMA for KV, V_colmajor is not supported");
@@ -57,6 +62,8 @@ struct CollectiveMainloopFwdSm90 {
 
     static_assert(ArchTag::kMinComputeCapability >= 90);
 
+    // MMA中矩阵V的主序情况(矩阵V表示为seq_len x dim, 按照CuTe如果序列维度连续就是k-major,反之为mn-major)
+    // 注意:在PV的矩阵乘中,序列维度是中间维度,即该GEMM的"K维度",而head-size维度则为"N维度"
     static constexpr cute::GMMA::Major MmaMajorV = !Is_FP8 && !V_colmajor ? GMMA::Major::MN : GMMA::Major::K;
     static constexpr cute::GMMA::Major TmaMajorV = !V_colmajor ? GMMA::Major::MN : GMMA::Major::K;
 
@@ -72,49 +79,64 @@ struct CollectiveMainloopFwdSm90 {
     static_assert(!(!Mma1_is_RS && Is_FP8), "Mma1 must be RS if FP8");
     static_assert(!(!Mma1_is_RS && Transpose_V), "Mma1 must be RS if Transpose_V");
 
+    // WGMMA的AtomLayout.`64`为MMAOp的M维度大小,因此这里将WG沿M维度重复
     using AtomLayoutMNK = Layout<Shape<Int<kBlockM / 64>, _1, _1>>;
+    // 矩阵QK相乘的MMAOp
     using TiledMma0 = decltype(cute::make_tiled_mma(
         std::conditional_t<
             !Mma0_is_RS,
-            decltype(cute::GMMA::ss_op_selector<Element, Element, ElementAccum, TileShape_MNK>()),
-            decltype(cute::GMMA::rs_op_selector<Element, Element, ElementAccum, TileShape_MNK>())
+            // QK均为k-major(head-dim主序)
+            decltype(cute::GMMA::ss_op_selector<Element, Element, ElementAccum, TileShape_MNK>()),  // 选择SM90的SS-MMAOp
+            decltype(cute::GMMA::rs_op_selector<Element, Element, ElementAccum, TileShape_MNK>())   // 选择SM90的RS-MMAOp
         >{},
         AtomLayoutMNK{}));
+    // 矩阵PV相乘的MMAOp
     using TiledMma1 = decltype(cute::make_tiled_mma(
         std::conditional_t<
             !Mma1_is_RS,
             decltype(cute::GMMA::ss_op_selector<Element, Element, ElementAccum,
+                     // 此次是MxKxN的矩阵乘维度,因此要使用`select()`进行调整
                      decltype(select<0, 2, 1>(TileShape_MNK{})), GMMA::Major::K, MmaMajorV>()),
             decltype(cute::GMMA::rs_op_selector<Element, Element, ElementAccum,
                      decltype(select<0, 2, 1>(TileShape_MNK{})), GMMA::Major::K, MmaMajorV>())
         >{},
         AtomLayoutMNK{}));
 
+    // 用于MMA的线程数
     static constexpr int NumMmaThreads = size(TiledMma0{});
+    // 生产者线程数 =不转置矩阵V&&矩阵QKV都使用TMA拷贝 ? 32 (warp线程数) : 128 (warp-group线程数)
     static constexpr int NumProducerThreads = !Transpose_V && Use_TMA_KV && Use_TMA_Q ? cutlass::NumThreadsPerWarp : cutlass::NumThreadsPerWarpGroup;
     static_assert(NumMmaThreads % cutlass::NumThreadsPerWarpGroup == 0);
+    // 用于MMA的WG数量
     static constexpr int NumMmaWarpGroups = NumMmaThreads / cutlass::NumThreadsPerWarpGroup;
     static_assert(NumMmaWarpGroups == 1 || NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
 
+    // `ss_smem_selector()`:用于获得最大的用于WGMMA的SMEM的AtomLayout
     using SmemLayoutAtomQ = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
         decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
+    // (kBlockM,kHeadDim)
     using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtomQ{}, select<0, 2>(TileShape_MNK{})));
 
     using SmemLayoutAtomK = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
         decltype(cute::get<1>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
+    // (kBlockN,kHeadDim,kStages)
     using SmemLayoutK = decltype(tile_to_shape(
         SmemLayoutAtomK{},
         make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})));
 
     using SmemLayoutAtomVt = decltype(cutlass::gemm::collective::detail::ss_smem_selector<TmaMajorV, Element,
-        decltype(cute::get<2>(TileShape_MNK{})), decltype(cute::get<1>(TileShape_MNK{}))>());
+        decltype(cute::get<2>(TileShape_MNK{})), decltype(cute::get<1>(TileShape_MNK{}))>());   // (kHeadDim,kBlockN)
+    // (kHeadDim,kBlockN,kStages)
     using SmemLayoutVt = decltype(tile_to_shape(
         SmemLayoutAtomVt{},
         make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{}), Int<kStages>{}),
+        // [QTS] 调整维度顺序的作用是什么?
         std::conditional_t<TmaMajorV == GMMA::Major::K, cute::Step<_1, _2, _3>, cute::Step<_2, _1, _3>>{}));
 
     using SmemLayoutAtomVtMma = decltype(cutlass::gemm::collective::detail::ss_smem_selector<MmaMajorV, Element,
         decltype(cute::get<2>(TileShape_MNK{})), decltype(cute::get<1>(TileShape_MNK{}))>());
+    // 与`SmemLayoutVt`的不同主要在`MmaMajorV`上,该layout似乎是用MMA的线程进行G->S拷贝
+    // (kHeadDim,kBlockN,kStages)
     using SmemLayoutVtMma = decltype(tile_to_shape(
         SmemLayoutAtomVtMma{},
         make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{}), Int<kStages>{}),
@@ -123,14 +145,17 @@ struct CollectiveMainloopFwdSm90 {
     // Only used if we're using cp.async to load V
     using SmemLayoutAtomVCpAsync = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
         decltype(cute::get<1>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
+    // (kHeadDim,kBlockN,kStages)
     using SmemLayoutVCpAsync = decltype(tile_to_shape(
         SmemLayoutAtomVCpAsync{},
         make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})));
 
     using SmemLayoutAtomP = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
         decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<1>(TileShape_MNK{}))>());
+    // (kBlockM,kBlockN)
     using SmemLayoutP = decltype(tile_to_shape(SmemLayoutAtomP{}, select<0, 1>(TileShape_MNK{})));
 
+    // 基于stmatrix指令
     using SmemCopyAtomP = Copy_Atom<cute::SM90_U32x4_STSM_N, Element>;
 
     // Use LDSM.T and STSM to transpose V in the case of FP8 and V being row-major.
@@ -146,7 +171,11 @@ struct CollectiveMainloopFwdSm90 {
     using LDSM_value_stride = Stride<_1, _2, _16, _4>;
     using LDSM_divide_shape = std::conditional_t<kHeadDim_multiple_64, Shape<_64, _8>, Shape<_32, _8>>;
     using S2RTiledCopyVt = decltype(make_tiled_copy(
-        Copy_Atom<SM75_U16x8_LDSM_T, Element>{}, Layout<LDSM_thread_shape, LDSM_thread_stride>{},
+        // ldmatrix.trans指令
+        Copy_Atom<SM75_U16x8_LDSM_T, Element>{}, 
+        // thr_layout (_32,_4,_1,_1):(_4,_1,_0,_0) or (_16,_4,_1,_2):(_4,_1,_0,_64)
+        Layout<LDSM_thread_shape, LDSM_thread_stride>{},
+        // val_layout (_2,_2,_1,_4):(_1,_2,_16,_4)
         Layout<LDSM_value_shape, LDSM_value_stride>{}));
 
     using STSM_thread_shape  = std::conditional_t<kHeadDim_multiple_64, Shape<_8, _4, _4, _1>, Shape<_8, _4, _2, _2>>;
@@ -161,13 +190,18 @@ struct CollectiveMainloopFwdSm90 {
     // using STSM_value_stride = Stride<_4, _1, _0, _8>;
     // using STSM_divide_shape = Shape<_16, _16>;
     using R2STiledCopyV = decltype(make_tiled_copy(
-        Copy_Atom<SM90_U32x4_STSM_N, Element>{}, Layout<STSM_thread_shape, STSM_thread_stride>{},
+        Copy_Atom<SM90_U32x4_STSM_N, Element>{}, 
+        // (_8,_4,_4,_1):(_4,_1,_32,_0) or (_8,_4,_2,_2):(_4, _1,_32,_64)
+        Layout<STSM_thread_shape, STSM_thread_stride>{},
+        // (_1,_4,_2,_2):(_0,_1,_4,_8)
         Layout<STSM_value_shape, STSM_value_stride>{}));
 
     using GmemTiledCopyQ = cute::SM90_TMA_LOAD;
+    // SM90_TMA_LOAD or SM90_TMA_LOAD_MULTICAST
     using GmemTiledCopyKV = decltype(cutlass::gemm::collective::detail::sm90_cluster_shape_to_tma_atom(shape<0>(ClusterShape{})));
 
     // We use CpAsync for K and V if PagedKV and AppendKV, since TMA doesn't work there
+    // 每次向量化从GMEM读取的元素个数
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "Headdim must be a multiple of kGmemElemsPerLoad");
     // We want each "row" to have 64 elements (128 bytes, i.e. 1 cache line). E.g. if hdim=128, we want each
@@ -175,24 +209,30 @@ struct CollectiveMainloopFwdSm90 {
     // We want each thread to have at least 2 loads in the K direction since in the case of non-interleaved
     // rotary (combining elements at indices 0 and rotary_dim/2, 1 and rotary_dim/2+1, etc), each thread will
     // load twice from the same row.
+    // head_dim一半的字节数
     static constexpr int kBytePerHalfRow = kHeadDim / 2 * sizeof(Element);
+    // GMEM分块K维度大小(一半)
     static constexpr int kBlockKGmem = (kBytePerHalfRow % 128 == 0 ? 128 : (kBytePerHalfRow % 64 == 0 ? 64 : 32)) / sizeof(Element);
+    // GMEM分块K维度每行的线程数(向量化读取的次数)
     static constexpr int kGmemThreadsPerRow = kBlockKGmem / kGmemElemsPerLoad;
     static_assert(NumMmaThreads % kGmemThreadsPerRow == 0, "NumMmaThreads must be a multiple of kGmemThreadsPerRow");
     // We assume threads loading the same row are in the same warp. This is for an optimization in PagedKV where
     // these threads share the same page table entry and share the work of computing pointers to paged K and paged V.
     static_assert(cutlass::NumThreadsPerWarp % kGmemThreadsPerRow == 0, "kGmemThreadsPerRow must divide NumThreadsPerWarp");
+    // G->S CopyAtom thr_layout
     using GmemLayoutAtom = Layout<Shape <Int<NumMmaThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                                   Stride<Int<kGmemThreadsPerRow>, _1>>;
     // If AppendKV, we'll be loading Q for rotary, and we assume divisibility to avoid predication
     static_assert(!AppendKV || kBlockM % CUTE_STATIC_V(shape<0>(GmemLayoutAtom{})) == 0, "kBlockM must be a multiple of NumMmaThreads / kGmemThreadsPerRow");
+    // 用于KVCache的G->S读取
     using GmemTiledCopyAppendKV = decltype(
-        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
+        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{}, // 向量化读取
                         GmemLayoutAtom{},
                         Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per store
 
     using ShapeQKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen, d, head, batch)
-    using StrideQK = cute::Stride<int64_t, _1, int64_t, int64_t>;
+    using StrideQK = cute::Stride<int64_t, _1, int64_t, int64_t>;   // head_dim维度连续
+    // 非列主序则head_dim维度连续,列主序则序列维度连续
     using StrideV = std::conditional_t<!V_colmajor, StrideQK, cute::Stride<_1, int64_t, int64_t, int64_t>>;
     // ((qhead_per_khead, seqlen_q), d, nheads_kv, batch, num_splits)
     using ShapeQPacked = std::conditional_t<!PackGQA, ShapeQKV, cute::Shape<cute::Shape<int32_t, int32_t>, int32_t, int32_t, int32_t>>;
@@ -204,24 +244,25 @@ struct CollectiveMainloopFwdSm90 {
     using StrideDescale = cute::Stride<int64_t, int64_t>;
 
     using TMA_Q = decltype(make_tma_copy_A_sm90(
-        GmemTiledCopyQ{},
-        make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQKV{}, StrideQK{}),
-        SmemLayoutQ{},
-        TileShape_MNK{},
-        ClusterShape{}));
+        GmemTiledCopyQ{},   // copy_op
+        make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQKV{}, StrideQK{}),   // gtensor
+        SmemLayoutQ{},      // slayout
+        TileShape_MNK{},    // cta_tiler    [QTS]为什么提供了三个维度
+        ClusterShape{}));   // cluster_size
 
     using TMA_K = decltype(make_tma_copy_B_sm90(
         GmemTiledCopyKV{},
         make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQKV{}, StrideQK{}),
-        take<0, 2>(SmemLayoutK{}),
+        take<0, 2>(SmemLayoutK{}),  // (kBlockN,kHeadDim)
         TileShape_MNK{},
         ClusterShape{})); // mcast along M mode for this N load, if any
 
     using TMA_V = decltype(make_tma_copy(
         GmemTiledCopyKV{},
+        // [QTS]这里select似乎是将headDim维度放到了最前面
         make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQKV{}, select<1, 0, 2, 3>(StrideV{})),
-        take<0, 2>(SmemLayoutVt{}),
-        select<2, 1>(TileShape_MNK{}),
+        take<0, 2>(SmemLayoutVt{}), // (kHeadDim,kBlockN)
+        select<2, 1>(TileShape_MNK{}),  // (kHeadDim,kBlockN)
         size<0>(ClusterShape{}))); // mcast along M mode for this N load, if any
 
     // Set the bytes transferred in this TMA transaction (may involve multiple issues)
@@ -232,6 +273,7 @@ struct CollectiveMainloopFwdSm90 {
 
     using PipelineTmaAsync = std::conditional_t<CUTE_STATIC_V(size(ClusterShape{})) == 1, typename cutlass::PipelineTmaAsyncNoCluster<kStages>, typename cutlass::PipelineTmaAsync<kStages>>;
     using MainloopPipelineK = std::conditional_t<Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
+    // 矩阵V不需要转置(序列维度连续)且使用TMA
     using MainloopPipelineV = std::conditional_t<!Transpose_V && Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
     using MainloopPipelineVt = std::conditional_t<Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
     // We always use TMA for K_new and V_new
@@ -395,6 +437,7 @@ struct CollectiveMainloopFwdSm90 {
             take<0, 2>(SmemLayoutVt{}),
             select<2, 1>(TileShape_MNK{}),
             size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
+        // (seqlen, d, head, batch)
         Tensor mKnew = make_tensor(make_gmem_ptr(args.ptr_K_new), args.shape_K_new, args.stride_K_new);
         TMA_K tma_load_K_new = make_tma_copy_B_sm90(
             GmemTiledCopyKV{},
@@ -452,6 +495,8 @@ struct CollectiveMainloopFwdSm90 {
     CUTLASS_DEVICE
     static void prefetch_tma_descriptors(Params const& params) {
         if constexpr (Use_TMA_Q) {
+            // `prefetch_tma_descriptor()`:内联prefetch.tensormap指令.将包含指定地址的缓存行带入`.const`或`.param`内存状态空间,
+            //                             以供后续`cp.async.bulk.tensor`指令使用
             cute::prefetch_tma_descriptor(params.tma_load_Q.get_tma_descriptor());
         }
         if constexpr (Use_TMA_KV) {
@@ -459,11 +504,13 @@ struct CollectiveMainloopFwdSm90 {
             cute::prefetch_tma_descriptor(params.tma_load_V.get_tma_descriptor());
         }
         if constexpr (AppendKV) {
+            // 对新产生的矩阵KV预取TMA描述符
             cute::prefetch_tma_descriptor(params.tma_load_K_new.get_tma_descriptor());
             cute::prefetch_tma_descriptor(params.tma_load_V_new.get_tma_descriptor());
         }
     }
 
+    // 返回N维度有效线程块的最大和最小索引值
     CUTLASS_DEVICE
     cute::tuple<int, int> get_n_block_min_max(Params const& params, SeqlenInfo_t const& seqlen_info,
                                               int m_block, int bidb, int split_idx=0, int num_splits=1) {
@@ -471,18 +518,23 @@ struct CollectiveMainloopFwdSm90 {
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
         int const seqlen_k = seqlen_info.seqlen_k;
         int const seqlen_q = seqlen_info.seqlen_q;
+        // N维度线程块最大索引
         int n_block_max = cute::ceil_div(seqlen_k, kBlockN);
         if constexpr (Is_causal || Is_local) {
+            // M维度最大值边界
             int m_idx_max = (m_block + 1) * kBlockM;
             // TODO: check off-by-1 error
+            // 根据GQA的Q头共享K头的关系调整M维度
             if (PackGQA) { m_idx_max = params.qhead_per_khead_divmod.divide(m_idx_max - 1) + 1 ; }
             n_block_max = std::min(n_block_max,
+                                   // 根据滑动窗口调整N维度线程块最大索引
                                    cute::ceil_div(m_idx_max + seqlen_k - seqlen_q + params.window_size_right, kBlockN));
         }
         int n_block_min = 0;
         if constexpr (Is_local) {
             int m_idx_min = m_block * kBlockM;
             if (PackGQA) { m_idx_min = params.qhead_per_khead_divmod.divide(m_idx_min); }
+            // 根据滑动窗口调整N维度线程块最小索引
             n_block_min = std::max(int(0), (m_idx_min + seqlen_k - seqlen_q - params.window_size_left) / kBlockN);
         }
         // if (threadIdx.x == 128) { printf("Inside, bid.x = %d, bid.y = %d, bid.z = %d, split_idx = %d, n_block_min: %d, n_block_max: %d\n", blockIdx.x, blockIdx.y, blockIdx.z, split_idx, n_block_min, n_block_max); }
@@ -510,30 +562,38 @@ struct CollectiveMainloopFwdSm90 {
          ) {
 
         auto [m_block, bidh, bidb, split_idx] = block_coord;
+        // N维度有效线程块的最大和最小索引值
         auto [n_block_min, n_block_max] = get_n_block_min_max(params, seqlen_info, m_block, bidb, split_idx, params.num_splits);
         // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
         if constexpr (Is_causal || Is_local || Varlen || Split) {
-            if (n_block_max <= n_block_min) {
-                scheduler_prefetch();
+            if (n_block_max <= n_block_min) {   // 当前没有有效线程块
+                scheduler_prefetch();   // 调度器预取下一分块任务
                 return;
             }
         }
 
+        // (kBlockM,kHeadDim)
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
+        // (kBlockN,kHeadDim,kStages)
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
+        // 将SMEM的张量从按字节寻址转换为按T数据类型寻址,当需要从SMEM读取到寄存器时使用
+        // ref: https://github.com/NVIDIA/cutlass/issues/2259
         Tensor sK_pi = as_position_independent_swizzle_tensor(sK);
         // as_position_independent_swizzle_tensor makes address calculation easier when we do LDSM & STSM to transpose.
         // But it requires smem_vt and smem_v to be aligned to e.g 512 bytes.
+        // (kHeadDim,kBlockN,kStages)
         Tensor sVt = [&] {
             if constexpr (!Transpose_V) {
                 return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVt{});
-            } else {
+            } else {    // 需要对矩阵V转置时,需要将V加载至寄存器,因此需要转化为按数据类型寻址
                 return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_vt.data()), SmemLayoutVt{}));
             }
         }();
         // Only used if Transpose_V
+        // (kHeadDim,kBlockN,kStages)
         Tensor sV = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{}));
         // Only used if we're using cp.async to load V
+        // (kHeadDim,kBlockN,kStages)
         Tensor sVcpasync = [&] {
             if constexpr (!Transpose_V) {
                 return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVCpAsync{}));
@@ -553,13 +613,19 @@ struct CollectiveMainloopFwdSm90 {
 
         bool const is_varlen_q = Varlen && params.cu_seqlens_q;
         bool const is_varlen_k = Varlen && params.cu_seqlens_k;
+        // (seqlen, d)
         Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
+        // (seqlen, d)
         Tensor mK_TMA = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
+        // (d, seqlen)
         Tensor mVt_TMA = params.tma_load_V.get_tma_tensor(select<1, 0, 2, 3>(params.shape_K))(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
 
+        // (kBlockM, kHeadDim)
         Tensor gQ = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
         // if (cute::thread0()) { printf("Varlen = %d, params.leftpad_k = %p, leftpad_k = %d\n", Varlen, params.leftpad_k, leftpad_k); }
+        // (kBlockN, kHeadDim, #blocks_n)
         Tensor gK_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mK_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
+        // (kHeadDim, kBlockN, #blocks_n)
         Tensor gVt_TMA = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k), mVt_TMA), select<2, 1>(TileShape_MNK{}), make_coord(_0{}, _));  // (K, N, _)
 
         auto block_tma_Q = params.tma_load_Q.get_slice(_0{});
@@ -631,11 +697,15 @@ struct CollectiveMainloopFwdSm90 {
         auto load_K = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
             pipeline_k.producer_acquire(smem_pipe_write);
             if constexpr (!PagedKV) {
+                // TMA拷贝
                 copy(params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
                     tKgK_TMA(_, n_block), tKsK_TMA(_, smem_pipe_write.index()));
+                // TMA拷贝会自动更新barrier的stage状态,因此此处可以无需`producer_commit()`或者说`PipelineTmaAsync.producer_commit()`是Non-Op 
             } else {
                 constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
+                // 分页加载矩阵K
                 paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK_pi(_, _, smem_pipe_write.index()));
+                // 非阻塞指令,通知消费者线程
                 pipeline_k.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
             }
         };
@@ -677,6 +747,7 @@ struct CollectiveMainloopFwdSm90 {
         static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
         bool should_load_KV = !Use_TMA_KV || ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync());
 
+        // 加载矩阵KV G->S
         if (should_load_KV) {
             if constexpr (PagedKV) {
                 paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/, true /*First_iter*/>(n_block);
@@ -695,6 +766,7 @@ struct CollectiveMainloopFwdSm90 {
 
             if ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync()) {
                 shared_storage.pipelines.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
+                // TMA拷贝矩阵Q G->S
                 copy(params.tma_load_Q.with(reinterpret_cast<typename cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_Q), 0 /*mcast_mask*/, !Split ? TMA::CacheHintSm90::EVICT_FIRST : TMA::CacheHintSm90::EVICT_LAST),
                     tQgQ, tQsQ);
             }
@@ -721,6 +793,7 @@ struct CollectiveMainloopFwdSm90 {
         }
         int n_block_prev = n_block;
         --n_block;
+        // 倒序加载剩余矩阵KV的分块
         #pragma unroll (!Transpose_V && Use_TMA_KV ? 2 : 1)
         for (; n_block >= n_block_min; --n_block) {
             PipelineState smem_pipe_write_v = smem_pipe_write; // copy the state, write_v is always 1 step behind
@@ -794,6 +867,7 @@ struct CollectiveMainloopFwdSm90 {
             *  Waits for all stages to either be released (all Consumer UNLOCKs), or if the stage was never used
             *  then would just be acquired since the phase was still inverted from make_producer_start_state
             */
+            // `producer_tail()`用于避免生产者线程块提前退出
             pipeline_k.producer_tail(smem_pipe_write);
             pipeline_v.producer_tail(smem_pipe_write);
             if constexpr (Transpose_V) { pipeline_vt.producer_tail(smem_pipe_write); }
@@ -863,9 +937,13 @@ struct CollectiveMainloopFwdSm90 {
             if (n_block_max <= n_block_min) { return false; }
         }
 
+        // (kBlockM,kHeadDim)
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
+        // (kBlockN,kHeadDim,kStages)
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
+        // (kHeadDim,kBlockN,kStages)
         Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{});
+        // (kBlockM,kBlockN)
         Tensor sP = [&] {
             if constexpr (Mma1_is_RS) {
                 // We might not have smem_p if !Mma1_is_RS1, just use smem_q as a placeholder since we don't use it
@@ -904,6 +982,7 @@ struct CollectiveMainloopFwdSm90 {
 
         auto consumer_wait = [](auto& pipeline, auto& smem_pipe_read) {
             auto barrier_token = pipeline.consumer_try_wait(smem_pipe_read);
+            // 等待生产者完成
             pipeline.consumer_wait(smem_pipe_read, barrier_token);
         };
 
@@ -973,6 +1052,7 @@ struct CollectiveMainloopFwdSm90 {
             auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(thread_idx);
             Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
             Tensor tSsQ_copy_view = smem_thr_copy_Q.partition_S(cute::as_position_independent_swizzle_tensor(sQ));
+            // 矩阵Q S->R
             cute::copy(smem_tiled_copy_Q, tSsQ_copy_view, tSrQ_copy_view);
         }
 
@@ -980,10 +1060,13 @@ struct CollectiveMainloopFwdSm90 {
         if constexpr (IntraWGOverlap) {
             Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
             consumer_wait(pipeline_k, smem_pipe_read);
+            // QxK
             flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
             warpgroup_wait<0>();
+            // 消费者完成MMA计算释放SMEM资源
             pipeline_k.consumer_release(smem_pipe_read);
             scoremod_premask_fn(tSrS);
+            // 应用掩码
             mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
 
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
@@ -1159,13 +1242,16 @@ struct CollectiveMainloopFwdSm90 {
         return true;
     }
 
+    // 获取N序列维度新产生的矩阵KV的最大最小分块 {n_block_new_min, n_block_new_max}
     CUTLASS_DEVICE
     cute::tuple<int, int> get_n_block_k_new_min_max(Params const& params, SeqlenInfo_t const& seqlen_info,
                                                     int m_block, int bidb, int split_idx=0, int num_splits=1) {
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
         auto [n_block_min, n_block_max] = get_n_block_min_max(params, seqlen_info, m_block, bidb, split_idx, num_splits);
+        // 减去矩阵KV序列的原始长度(不包括新产生),得到新产生的矩阵KV的索引最大最小值
         int const idx_k_new_min = std::max(n_block_min * kBlockN - seqlen_info.seqlen_k_og, 0);
         int const idx_k_new_max = std::min(n_block_max * kBlockN - seqlen_info.seqlen_k_og, seqlen_info.seqlen_k_new);
+        // 新产生的矩阵KV的分块索引最大最小值
         int const n_block_new_min = idx_k_new_min / kBlockN;
         int const n_block_new_max = idx_k_new_max > idx_k_new_min ? cute::ceil_div(idx_k_new_max, kBlockN) : n_block_new_min;
         // if (threadIdx.x == 128 && m_block == 0) { printf("bidb = %d, seqlen_k_new = %d, seqlen_k_og = %d, n_block_min = %d, n_block_max = %d, idx_k_new_min = %d, idx_k_new_max = %d, n_block_new_min = %d, n_block_new_max = %d\n", bidb, seqlen_k_new, seqlen_k_og, n_block_min, n_block_max, idx_k_new_min, idx_k_new_max, n_block_new_min, n_block_new_max);}
@@ -1185,19 +1271,24 @@ struct CollectiveMainloopFwdSm90 {
          ) {
 
         auto [m_block, bidh, bidb, split_idx] = block_coord;
+        // N序列维度新产生的矩阵KV的最大最小分块
         auto [n_block_new_min, n_block_new_max] = get_n_block_k_new_min_max(params, seqlen_info, m_block, bidb, split_idx, params.num_splits);
         if (n_block_new_max <= n_block_new_min) { return false; }
 
+        // (kBlockN,kHeadDim,kStages)
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
+        // (kHeadDim,kBlockN,kStages)
         Tensor sVt = [&] {
-            if constexpr (!Transpose_V) {
+            if constexpr (!Transpose_V) {   // 不需要转置矩阵V
+                // 基于`SmemLayoutVtMma`的SMEM
                 return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVt{});
             } else {
                 return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_vt.data()), SmemLayoutVt{});
             }
         }();
 
-        // int const thread_idx = threadIdx.x % NumProducerThreads;
+        int const thread_idx = threadIdx.x % NumProducerThreads;
+        // 矩阵KV的Attention头的索引(不pack的时候要转化一下)
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
 
         // Prepare the TMA loads
@@ -1206,19 +1297,25 @@ struct CollectiveMainloopFwdSm90 {
         uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
 
         bool const is_varlen_k_new = Varlen && params.cu_seqlens_k_new;
+        // (seqlen_k, d):(_1@1,_1@0)
         Tensor mKnew_TMA = params.tma_load_K_new.get_tma_tensor(params.shape_K_new)(_, _, bidh_kv, !is_varlen_k_new ? bidb : 0);
+        // (d, seqlen_k):(_1@0,_1@1)
         Tensor mVnewt_TMA = params.tma_load_V_new.get_tma_tensor(select<1, 0, 2, 3>(params.shape_K_new))(_, _, bidh_kv, !is_varlen_k_new ? bidb : 0);
 
+        // (kBlockN,kHeadDim,#n_blocks)
         Tensor gKnew_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k_new, _0{}), mKnew_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
+        // (kHeadDim,kBlockN,#n_blocks)
         Tensor gVnewt_TMA = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k_new), mVnewt_TMA), select<2, 1>(TileShape_MNK{}), make_coord(_0{}, _));  // (K, N, _)
 
         auto block_tma_K_new = params.tma_load_K_new.get_slice(cluster_local_block_id.x);
+        // (TMAAtom, TMA_M, TMA_K, #n_blocks) -> ((TMAAtom, TMA_M, TMA_K), #n_blocks) = ((((kHeadDim,kBlockN),_1),_1,_1),#n_blocks)
         Tensor tKgKnew_TMA = group_modes<0, 3>(block_tma_K_new.partition_S(gKnew_TMA));  // (TMA, k)
         Tensor tKsK_TMA = group_modes<0, 3>(block_tma_K_new.partition_D(sK));  // (TMA, PIPE)
         auto block_tma_V_new = params.tma_load_V_new.get_slice(cluster_local_block_id.x);
         Tensor tVgVnewt_TMA = group_modes<0, 3>(block_tma_V_new.partition_S(gVnewt_TMA));  // (TMA, k)
         Tensor tVsVt_TMA = group_modes<0, 3>(block_tma_V_new.partition_D(sVt));  // (TMA, PIPE)
 
+        // TMA-Multicast设置掩码
         uint16_t mcast_mask_kv = 0;
         if constexpr (cute::is_same_v<GmemTiledCopyKV, SM90_TMA_LOAD_MULTICAST>) {
             auto block_layout = Layout<ClusterShape>{}; // (m,n) -> block_id
@@ -1228,7 +1325,9 @@ struct CollectiveMainloopFwdSm90 {
         }
 
         auto load_K_new = [&] (int const n_block, auto const& smem_pipe_write) {
+            // 生产者准备生产,阻塞消费者线程的进一步执行
             pipeline_k_new.producer_acquire(smem_pipe_write);
+            // TMA拷贝矩阵K
             copy(params.tma_load_K_new.with(*pipeline_k_new.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_FIRST),
                 tKgKnew_TMA(_, n_block), tKsK_TMA(_, smem_pipe_write.index()));
         };
@@ -1242,8 +1341,10 @@ struct CollectiveMainloopFwdSm90 {
         int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
         // If this is true, we're guaranteed that only the first warp will execute this function
         static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
+        // 生产者的第一个warp的单个线程
         bool should_load_KV = (SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync();
 
+        // 倒序加载KV矩阵
         int n_block = n_block_new_max - 1;
         // Need to wait for barrier_O even before load_K_new since the pipelines for AppendKV
         // and the main attention are not the same. We want to make sure the consumers

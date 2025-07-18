@@ -67,15 +67,18 @@ public:
     using TileSchedulerArguments = typename flash::TileSchedulerArguments;
     using TileSchedulerParams = typename TileScheduler::Params;
 
+    // 用于加载数据的WG数
     static constexpr uint32_t NumLoadWarpGroups = 1;
+    // 用于MMA计算的WG数
     static constexpr uint32_t NumMmaWarpGroups = CUTE_STATIC_V(size(TiledMma0{})) / cutlass::NumThreadsPerWarpGroup;
     static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMma0{})) + (NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup);
+    // 每个线程块的线程数(用于数据加载的线程数+用于MMA计算的线程数)
     static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
     static_assert(NumMmaWarpGroups == 1 || NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
 
     /// Register requirement for Load and Math WGs
     // If we use cp.async to load K and V, we need more registers for the producer WG.
-    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 24 : 40) : 32);
+    static constexpr uint32_t LoadRegisterRequirement = 240; // NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 24 : 40) : 32);
     static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160);
     // If you want to print from the producer warp, you'd need to increase the number of registers
     // Otherwise you'll get CUDA error.
@@ -83,6 +86,7 @@ public:
     // static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 2 ? 232 : 152;
 
     // Kernel level shared memory storage
+    // Mainloop的SMEM需要填充的字节数(用于将矩阵O完全覆盖矩阵V)
     // We overlap the shared memory for the mainloop and epilogue. However, we only want smem_o to overlap with smem_v
     // and nothing else, so we'll pad in case sizeof(smem_o) > sizeof(smem_v).
     static constexpr int mainloop_smem_padding_ = int(sizeof(typename CollectiveEpilogue::TensorStorage)) - int(sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v)));
@@ -174,7 +178,9 @@ public:
     void
     operator()(Params const& params, char* smem_buf) {
 
+        // MMA计算线程数
         static constexpr int NumMmaThreads = NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
+        // MMA线程偏移(前面是TMA加载数据的WG)
         static constexpr int MmaThreadOffset = NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup;
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
 
@@ -190,11 +196,15 @@ public:
 
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
+        // warp中选择一个线程
         int const lane_predicate = cute::elect_one_sync();
+        // 同步获取warp-id
         int const warp_idx = cutlass::canonical_warp_idx_sync();
 
         // Issue Tma Descriptor Prefetch from a single thread
+        // warp-0即TMA的第一个warp
         if (warp_idx == 0 && lane_predicate) {
+            // 预取TMA描述符
             CollectiveMainloop::prefetch_tma_descriptors(params.mainloop);
             CollectiveEpilogue::prefetch_tma_descriptors(params.epilogue);
         }
@@ -203,22 +213,30 @@ public:
         int const warp_group_thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
         int warp_group_idx = cutlass::canonical_warp_group_idx();
 
+        // 初始化屏障设置arrive-count
         if (warp_idx == 0 && lane_predicate) {
+            // 使用TMA设置arrive-count为1(只有1个线程执行TMA),反之需要多个线程
             shared_storage.pipelines.barrier_Q.init(Use_TMA_Q ? 1 : NumProducerThreads /*numThreads*/);
             shared_storage.pipelines.barrier_O.init(size(ClusterShape{}) * (Use_TMA_O ? 1 : NumMmaThreads) /*numThreads*/);
         }
 
         // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
         PipelineParamsK pipeline_params_k;
+        // 第一个WG是生产者(矩阵加载),剩余为消费者(矩阵计算)
         pipeline_params_k.role = warp_group_idx == 0
             ? MainloopPipelineK::ThreadCategory::Producer
             : MainloopPipelineK::ThreadCategory::Consumer;
-        if constexpr (Use_TMA_KV) {
+        if constexpr (Use_TMA_KV) { // `PipelineTmaAsync`
+            // 设置TMA的加载矩阵K的字节数
             pipeline_params_k.transaction_bytes = CollectiveMainloop::TmaTransactionBytesK;
+            // WG中的第一个线程作为领导者线程
             pipeline_params_k.is_leader = warp_group_thread_idx == 0;
+            // 消费者数量为MMA计算的线程数
             pipeline_params_k.num_consumers = NumMmaThreads;
-        } else {
+        } else {    // 不使用TMA `PipelineAsync`
+            // 设置消费者arrive-count(MMA计算的线程数)
             pipeline_params_k.consumer_arv_count = NumMmaThreads;
+            // 设置生产者arrive-count(矩阵加载的线程数)
             pipeline_params_k.producer_arv_count = NumProducerThreads;
         }
 
@@ -231,14 +249,14 @@ public:
         }();
         // MainloopPipelineV pipeline_v(shared_storage.pipelines.pipeline_v, pipeline_params_v, ClusterShape{});
         MainloopPipelineV pipeline_v = [&] {
-            if constexpr (!Transpose_V) {
+            if constexpr (!Transpose_V) {   // 无需转置矩阵V(序列维度连续),则复用`pipeline_params_k`参数
                 static_assert(is_same_v<PipelineParamsK, PipelineParamsV>);
                 if constexpr (Use_TMA_KV) {
                     return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_k, ClusterShape{});
                 } else {
                     return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_k);
                 }
-            } else {
+            } else {    // 需要转置矩阵V    `PipelineAsync`
                 PipelineParamsV pipeline_params_v;
                 pipeline_params_v.role = warp_group_idx == 0
                     ? MainloopPipelineV::ThreadCategory::Producer
@@ -255,6 +273,7 @@ public:
         // Technically for pipeline_params_vt, warp0 of WG0 is the producer and all of WG0 are consumers.
         // However, the thread role isn't used in the pipeline implementation.
         MainloopPipelineVt pipeline_vt = [&] {
+            // 注意对于矩阵V需要转置的情况,消费者是进行矩阵加载的线程
             if constexpr (Use_TMA_KV) {
                 pipeline_params_k.num_consumers = NumProducerThreads; // TMA_V is only consumed by the producer WG
                 return MainloopPipelineVt(shared_storage.pipelines.pipeline_vt, pipeline_params_k, ClusterShape{});
@@ -271,6 +290,7 @@ public:
         pipeline_params_kv_new.transaction_bytes = CollectiveMainloop::TmaTransactionBytesK;
         pipeline_params_kv_new.is_leader = warp_group_thread_idx == 0;
         pipeline_params_kv_new.num_consumers = NumMmaThreads;
+        // `PipelineTmaAsync` or nullptr
         auto pipeline_k_new = cute::conditional_return<AppendKV>(MainloopPipelineKVNew(shared_storage.pipelines.pipeline_k_new, pipeline_params_kv_new, ClusterShape{}), nullptr);
         auto pipeline_v_new = cute::conditional_return<AppendKV>(MainloopPipelineKVNew(shared_storage.pipelines.pipeline_v_new, pipeline_params_kv_new, ClusterShape{}), nullptr);
 
@@ -278,15 +298,18 @@ public:
         CollectiveEpilogue collective_epilogue;
 
         // We need this to guarantee that the Pipeline init is visible to all producers and consumer blocks in the Cluster
-        if constexpr (size(ClusterShape{}) > 1) {
+        if constexpr (size(ClusterShape{}) > 1) {   // 启用了线程块集群
+            // `cluster_arrive_relaxed()`:内联barrier.cluster.arrive.relaxed指令.
+            //   标记达到但对之前的内存访问不提供内存排序和可见性保证
             cute::cluster_arrive_relaxed();
+            // `cluster_wait()`:内联barrier.cluster.wait指令.等待集群中所有线程均完成arrive操作
             cute::cluster_wait();
-        } else {
+        } else {    // 未启用线程块集群
             __syncthreads();
         }
 
         if (warp_group_idx == 0) {  // Producer
-            cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+            // cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
 
             // The pipelines for AppendKV and main attention are different, since e.g. main attention
             // might use cp.async to load KV (if PagedKV) while AppendKV always uses TMA to load
@@ -298,40 +321,51 @@ public:
 
             TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
             int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
+            // 是否只有一个生产者warp
             static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
             if constexpr (SingleProducerWarp) {
+                // WG中的非生产者warp均退出
                 if (warp_idx_in_warpgroup != 0) { return; }
             }
+            // 多个生产者warp且对于非第一个warp
+            // [QTS] 为什么要求非第一个warp去初始化
             if (!SingleProducerWarp && warp_idx_in_warpgroup != 0) { scheduler.init_consumer(); }
 
             // Load Q, K, V
             for (auto work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0 ? scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler) : scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
+                 // 判断当前work_tile是否有效(无效则退出)
                  work_tile_info.is_valid(params.scheduler);
+                 // 获取下一个work_tile
                  work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0 ? scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info) : scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
 
+                // {m_block, bidh, bidb, split_idx}
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 SeqlenInfo_t seqlen_info{
                     get<2>(block_coord) /*bidb*/,
-                    get<0>(params.mainloop.shape_Q),
-                    !PagedKV ? size<0>(params.mainloop.shape_K) : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable),
-                    get<0>(params.mainloop.shape_K_new),
+                    get<0>(params.mainloop.shape_Q),    /*seqlen_q_static*/
+                    !PagedKV ? size<0>(params.mainloop.shape_K) : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable),  /*seqlen_k_static*/
+                    get<0>(params.mainloop.shape_K_new),    /*shape_K_new_0*/
                     params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
                 };
-                if constexpr (AppendKV) {
+                if constexpr (AppendKV) {   // 需要追加新产生的矩阵KV
+                    // 获取新产生的矩阵K和V,返回是否有新数据加载
                     bool tile_new_valid = collective_mainloop.load_kv_new(
                         params.mainloop, pipeline_k_new, pipeline_v_new,
                         smem_pipe_write_new, shared_storage, seqlen_info, block_coord, work_idx);
                     if (tile_new_valid) {
                         // if (threadIdx.x == 0) { printf("Producer: Before sync\n"); }
+                        // TMA线程和MMA线程同步 [QTS]原因是什么?
                         cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::AppendKV) /*id*/);
                         // if (threadIdx.x == 0) { printf("Producer: After sync\n"); }
                     }
                 }
                 auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() {
+                    // 调度器预取下一个工作任务
                     scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                 };
                 // pipeline_vt won't be used if we don't need to transpose V.
+                // 加载矩阵QKV
                 collective_mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
                                          shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
             }
@@ -360,6 +394,7 @@ public:
                 Tensor tOrO = partition_fragment_C(tiled_mma1, select<0, 2>(TileShape_MNK{}));
                 float softmax_scale_log2 = params.mainloop.softmax_scale_log2;
                 // If there's tanh softcap, the scaling will be done before tanh.
+                // {m_block, bidh, bidb, split_idx}
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 int const bidb = get<2>(block_coord);
                 if constexpr (Is_FP8 && !Has_softcap) {

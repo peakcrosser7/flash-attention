@@ -85,7 +85,7 @@ void set_params_fprop(Flash_fwd_params &params,
                       int window_size_left,
                       int window_size_right,
                       const float softcap=0.f,
-                      const int sm_margin=0) {
+                      const int sm_margin=0) {  // SM保留数(留给通信等其他目的的SM数)
 
     // Reset the parameters
     params = {};
@@ -166,6 +166,7 @@ void set_params_fprop(Flash_fwd_params &params,
     params.window_size_right = window_size_right;
 
     params.arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
+    // SM总数减去其他目的而保留的SM数
     params.num_sm = at::cuda::getCurrentDeviceProperties()->multiProcessorCount - sm_margin;
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
@@ -368,6 +369,7 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream) {
     #endif
 }
 
+// 是否对GQA进行打包
 inline bool get_pack_gqa(Flash_fwd_params const& params) {
     // Always enable PackGQA for Sm8x or PagedKV or Split to reduce compilation and binary size.
     // Has little effect on speed.
@@ -521,6 +523,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         TORCH_CHECK(page_table.stride(-1) == 1, "page_table must have contiguous last dimension");
     }
 
+    // 变长矩阵Q序列 (batch_size+1,)
     at::Tensor cu_seqlens_q;
     bool const is_varlen_q = cu_seqlens_q_.has_value();
     if (is_varlen_q) {
@@ -529,6 +532,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype torch.int32");
         TORCH_CHECK(max_seqlen_q_.has_value(), "max_seqlen_q must be provided if cu_seqlens_q is provided");
     }
+    // 变长矩阵K序列 (batch_size+1,)
     at::Tensor cu_seqlens_k;
     bool const is_varlen_k = cu_seqlens_k_.has_value();
     if (is_varlen_k) {
@@ -547,16 +551,24 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
 
     auto const sizes = q.sizes();
     const int batch_size = !is_varlen_q ? sizes[0] : cu_seqlens_q.size(0) - 1;
+    // 矩阵Q序列长度(变长为最大长度)
     int seqlen_q = !is_varlen_q ? sizes[1] : max_seqlen_q_.value();
+    // 整个批次的矩阵Q序列长度
     int total_q = !is_varlen_q ? batch_size * sizes[1] : sizes[0];
+    // 矩阵Q的Attention头数
     int num_heads = q.size(-2);
     int const head_size = q.size(-1);
+    // 每个序列最大页面数
     int const max_num_pages_per_seq = !paged_KV ? 0 : page_table.size(1);
     int const num_pages = !paged_KV ? 0 : k.size(0);
     int const page_size = !paged_KV ? 1 : k.size(1);
+    // 矩阵K序列长度(变长为最大长度)
     int const seqlen_k = !is_varlen_k ? (!paged_KV ? k.size(1) : max_num_pages_per_seq * page_size) : max_seqlen_k_.value();
+    // 整个批次的矩阵K序列长度
     int const total_k = !is_varlen_k ? batch_size * k.size(1) : k.size(0);
+    // 矩阵KV的Attention头数
     int const num_heads_k = k.size(-2);
+    // 矩阵K的批次大小
     int const batch_size_k = !paged_KV ? (!is_varlen_k ? k.size(0) : cu_seqlens_k.size(0) - 1) : page_table.size(0);
     if (!kv_batch_idx_.has_value()) {
         TORCH_CHECK(batch_size == batch_size_k, "batch_size must be equal to batch_size_k");
